@@ -526,6 +526,8 @@ static std::condition_variable g_polishCv;
 static bool g_delivering = false;               // a Deliver is inside SendUnicode right now
 static std::atomic<bool> g_polishCancel{ false };
 static bool g_polishEnabled = false;
+static bool g_sessionPolish = false;   // this session relies on the punctuation model
+static bool TargetSupportsOneShot(HWND top);   // defined with the rewrite paths
 
 static const wchar_t* OpenErrorMessage(HRESULT hr)
 {
@@ -713,6 +715,15 @@ static void TurnOn()
     }
     g.onAt = GetTickCount64();
     g.targetFocused = TargetHasFocus();
+    // One punctuation writer per session (spec 6.7): when the target can take the
+    // one-shot rewrite, ASR-supplied marks are stripped at injection and the
+    // punctuation model rewrites once at stop; when it cannot (or the capability
+    // cannot be established in time), nothing is stripped and no polish runs, so
+    // the user keeps exactly the punctuation the speech model provides.
+    g_sessionPolish = g_polishEnabled && TargetSupportsOneShot(g.target);
+    Log(L"INFO", g_sessionPolish
+        ? L"polish mode: punctuation model (target supports one-shot replace)"
+        : L"polish mode: speech-model punctuation (target does not support one-shot replace)");
     SetState(kOn);
     Log(L"INFO", L"dictation on: capture open at 16 kHz mono");
     ShowEyeball();
@@ -1910,10 +1921,40 @@ static void StartInjector()
 // one ended with whitespace.
 static wchar_t g_lastInjected = 0;
 
+// When the session's punctuation comes from the punctuation model, the speech
+// model's own marks are removed here so exactly one writer punctuates: the model
+// at stop. Digit-embedded marks (. in 3.14, , in 1,000, : in ratios) survive,
+// matching the punctuation pass's own keep rule.
+static bool IsAsrMark(wchar_t c)
+{
+    static const wchar_t* m = L".,;:!?\uFF0C\u3002\uFF1A\uFF1F\uFF01\uFF1B\u2026\u0964\u0965\u06D4";
+    return wcschr(m, c) != nullptr;
+}
+
+static void StripAsrMarks(std::wstring& s)
+{
+    std::wstring o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (IsAsrMark(c)) {
+            bool keep = (c == L'.' || c == L',' || c == L':') &&
+                        i > 0 && i + 1 < s.size() &&
+                        iswdigit(s[i - 1]) && iswdigit(s[i + 1]);
+            if (keep) o.push_back(c);
+            continue;
+        }
+        o.push_back(c);
+    }
+    s.swap(o);
+}
+
 static void QueueInject(const std::wstring& text, bool sep)
 {
     if (text.empty()) return;
     std::wstring out = text;
+    if (g_sessionPolish) StripAsrMarks(out);
+    if (out.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_injectMu);
         bool needSpace = sep && g_lastInjected != 0 && !iswspace(g_lastInjected) && !iswspace(text[0]);
@@ -2432,6 +2473,92 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
     return ok;
 }
 
+// ---- Capability: can this target take a one-shot punctuation rewrite? -------
+// Two accepted shapes: a classic EDIT/RichEdit child (EM_REPLACESEL path) or a
+// focused UIA element exposing a writable ValuePattern plus a TextPattern (the
+// SetValue path; TextPattern is required so the rewrite can verify the span
+// before touching anything, and so list items or buttons never qualify).
+static IUIAutomation* UiaSingleton()
+{
+    static IUIAutomation* uia = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(ci) || ci == RPC_E_CHANGED_MODE)
+            CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                             IID_PPV_ARGS(&uia));
+    }
+    return uia;
+}
+
+static bool FocusedUiaValueWritable(HWND target)
+{
+    IUIAutomation* uia = UiaSingleton();
+    if (!uia) return false;
+    IUIAutomationElement* el = nullptr;
+    IUnknown* pVal = nullptr; IUnknown* pTxt = nullptr;
+    IUIAutomationValuePattern* vp = nullptr;
+    IUIAutomationTextPattern* tp = nullptr;
+    bool ok = false;
+    do {
+        if (FAILED(uia->GetFocusedElement(&el)) || !el) break;
+        UIA_HWND hh = 0;
+        if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
+            HWND eh = (HWND)(INT_PTR)hh;
+            if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) break;
+        }
+        if (FAILED(el->GetCurrentPattern(UIA_ValuePatternId, &pVal)) || !pVal) break;
+        if (FAILED(pVal->QueryInterface(IID_PPV_ARGS(&vp)))) break;
+        BOOL ro = TRUE;
+        if (FAILED(vp->get_CurrentIsReadOnly(&ro)) || ro) break;
+        // A text surface is required, not just a settable value.
+        if (FAILED(el->GetCurrentPattern(UIA_TextPatternId, &pTxt)) || !pTxt) break;
+        if (FAILED(pTxt->QueryInterface(IID_PPV_ARGS(&tp)))) break;
+        ok = true;
+    } while (false);
+    if (tp) tp->Release();
+    if (pTxt) pTxt->Release();
+    if (vp) vp->Release();
+    if (pVal) pVal->Release();
+    if (el) el->Release();
+    return ok;
+}
+
+// UIA calls into a misbehaving provider can block for seconds, so the query runs
+// on its own thread and TurnOn waits at most 700 ms. Unknown falls back to
+// "unsupported", which is the conservative answer: the speech model keeps
+// typing its own punctuation and no rewrite will be attempted.
+struct CapProbe { HWND top; bool ok; HANDLE done; };
+static DWORD WINAPI CapProbeThread(LPVOID p)
+{
+    CapProbe* c = (CapProbe*)p;
+    c->ok = FocusedUiaValueWritable(c->top);
+    SetEvent(c->done);
+    return 0;
+}
+
+static bool TargetSupportsOneShot(HWND top)
+{
+    if (!top || !IsWindow(top)) return false;
+    HWND fe = FocusedEditOf(top);
+    if (fe) {
+        wchar_t cls[32]{};
+        GetClassNameW(fe, cls, 32);
+        if (_wcsicmp(cls, L"Edit") == 0 || wcsstr(cls, L"RICHEDIT")) return true;
+    }
+    CapProbe probe{ top, false, CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+    if (!probe.done) return false;
+    HANDLE th = CreateThread(nullptr, 0, CapProbeThread, &probe, 0, nullptr);
+    bool ok = false;
+    if (th) {
+        ok = (WaitForSingleObject(probe.done, 700) == WAIT_OBJECT_0) && probe.ok;
+        if (!ok) CloseHandle(th);   // hung provider: the thread finishes on its own
+    }
+    CloseHandle(probe.done);
+    return ok;
+}
+
 struct PolishJob { HWND target; std::wstring text; };
 
 static DWORD WINAPI PolishThread(LPVOID p)
@@ -2470,10 +2597,9 @@ static DWORD WINAPI PolishThread(LPVOID p)
         via = L"uia-value";
     }
     ULONGLONG dt2 = GetTickCount64() - t1;
-    {
-        // Raw in / polished out, verbatim, for drift diagnosis: the delta between
-        // ASR-supplied punctuation and model-supplied punctuation is invisible
-        // otherwise (char-count deltas hide a rewrite that strips as much as it adds).
+    if (LogTextEnabled()) {
+        // Raw in / polished out under the same diagnostic switch as the inject
+        // lines: app.log carries words only when the user opts into LogText.
         Log(L"INFO", (L"polish raw: " + job->text).c_str());
         if (oneShot) Log(L"INFO", (L"polish out: " + out).c_str());
     }
@@ -2514,7 +2640,7 @@ static void StopDictation(const wchar_t* why, bool userInitiated = false)
         {
             std::lock_guard<std::mutex> lk(g_engine.mu);
             g_engine.drain = true;
-            g_engine.drainPolish = g_polishEnabled;
+            g_engine.drainPolish = g_sessionPolish;
             g_engine.drainUntil = GetTickCount64() + 2000;
         }
         g_engine.cv.notify_all();

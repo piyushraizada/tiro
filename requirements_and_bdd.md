@@ -592,6 +592,15 @@ the polished span, so dictation can continue from there. Targets matching
 neither are left exactly as typed; Tiro never borrows the clipboard and never
 sends backspace or selection keystrokes.
 
+Exactly one writer punctuates per session, decided when dictation turns on: if
+the target supports the one-shot rewrite, marks supplied by the speech model are
+stripped at injection and the punctuation model rewrites once at stop; if the
+target does not support it — or the capability cannot be established within
+700 ms, since accessibility queries into a broken provider can hang — the speech
+model's own punctuation is injected untouched and no polish pass runs, so the
+user always gets at least the punctuation the speech model provides. The mode
+chosen is logged at every turn-on.
+
 Failure is always safe: if the model is not ready, the output is empty, the
 target is no longer foreground, the target does not support the one-shot
 replace, or the rewrite is interrupted, the raw text
@@ -993,6 +1002,24 @@ Scenario: An unsupported target keeps its text
   When the user stops dictating with the hotkey
   Then the dictated text remains exactly as injected
   And the log records "polish: target does not support one-shot replace"
+
+Scenario: A supported target silences speech-model punctuation
+  Given punctuation is enabled and ready
+  And the target supports the one-shot rewrite
+  When the user dictates and the speech model supplies punctuation inline
+  Then the injected text carries none of those marks (digit-embedded marks excepted)
+  And the log records "polish mode: punctuation model (target supports one-shot replace)"
+  When the user stops dictating with the hotkey
+  Then the text is rewritten once by the punctuation model
+
+Scenario: An unsupported target keeps speech-model punctuation
+  Given punctuation is enabled and ready
+  And the target does not support the one-shot rewrite or the check times out
+  When the user dictates and the speech model supplies punctuation inline
+  Then the injected text carries those marks exactly as supplied
+  And the log records "polish mode: speech-model punctuation (target does not support one-shot replace)"
+  When the user stops dictating with the hotkey
+  Then no polish pass runs
 ```
 
 ### Feature: Capability boundaries
