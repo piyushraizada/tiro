@@ -506,7 +506,7 @@ switches. It grants no privilege, starts no dictation, and touches neither
 | `--restart` | Same hand-off as the menu item |
 | `--selftest <wav>` | Replays a WAV through the real recogniser (§5.11.1) |
 | `--live <wav> [--target <title>]` | Feeds a WAV into the live pipeline in the On state, optionally pinning a window by title, then keeps running |
-| `--rewrite-demo` | Headless paste-rewrite test with a clipboard sentinel; logs PASS/FAIL and quits |
+| `--rewrite-demo` | One-shot rewrite test against an owned RICHEDIT50W window; logs PASS/FAIL and quits |
 | `--polish-file <in> <out>` | Runs the polish model over a UTF-8 file; exit 2 if the model will not load, 3 on I/O failure |
 | `--polish-tokens <in> <out>` | Dumps token ids for verifying the tokenizer |
 
@@ -581,13 +581,15 @@ With `Polish=1`, a second ONNX model at `models\punctuation\`
 **user** stop only, the session text is rewritten in process — punctuation
 restored at word ends, sentence starts capitalised, standalone "i" → "I",
 whitespace collapsed, 400-token windows with 50-token overlap — and the target is
-updated in one act: the dictated span is selected (`EM_EXSETSEL` for RichEdit,
-UI Automation's text pattern otherwise, an injected shift+left burst as a last
-resort), the clipboard is borrowed and restored, and the polished text is pasted.
-If the clipboard cannot be opened the fallback is paced backspaces and retyping.
+updated in one act: for classic `EDIT`/`RichEdit` controls, `EM_EXSETSEL` plus
+`EM_REPLACESEL` are queued back-to-back so the control replaces the dictated span
+inside its own thread without ever painting a selection. Targets that do not
+expose such a control (Chromium-family, WinUI) are left exactly as typed; Tiro
+never borrows the clipboard and never sends backspace or selection keystrokes.
 
 Failure is always safe: if the model is not ready, the output is empty, the
-target is no longer foreground, or the rewrite is interrupted, the raw text
+target is no longer foreground, the target does not support the one-shot
+replace, or the rewrite is interrupted, the raw text
 stands and the reason is logged. Forced stops never polish.
 
 ### 6.8 Packaging
@@ -965,9 +967,18 @@ Scenario: Model absent
 
 Scenario: The rewrite lands in one step
   Given punctuation is enabled and ready
+  And the target exposes a classic edit or RichEdit control
   When the user stops dictating with the hotkey
   Then the dictated span is replaced in one act
-  And the log records "polish: <a> chars -> <b> chars via paste in <n> ms"
+  And no selection highlight is ever painted
+  And the log records "polish: <a> chars -> <b> chars via replace-sel in <n> ms"
+
+Scenario: An unsupported target keeps its text
+  Given punctuation is enabled and ready
+  And the target is a Chromium or WinUI control
+  When the user stops dictating with the hotkey
+  Then the dictated text remains exactly as injected
+  And the log records "polish: target does not support one-shot replace"
 ```
 
 ### Feature: Capability boundaries
@@ -1029,7 +1040,7 @@ Scenario: Inference falls behind
 | FR-1 capture | 16 kHz mono logged at turn-on; self-test uses the same stream |
 | FR-2 engine | `engine ready in <n> ms`; self-test transcript |
 | FR-3 topology | `core map:` and `core pinning:` lines |
-| FR-4 injection | live dictation; `--rewrite-demo` for the paste rewrite |
+| FR-4 injection | live dictation; `--rewrite-demo` for the one-shot rewrite |
 | FR-5 state machine | tray icon states and state-change log lines |
 | FR-6 notifications | `--debug --notify`; the message table above |
 | FR-7 configuration | registry inspection; hotkey dialog behaviour |

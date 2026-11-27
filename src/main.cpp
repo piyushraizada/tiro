@@ -9,7 +9,6 @@
 #include <audioclient.h>
 #include <mmreg.h>
 #include <functiondiscoverykeys_devpkey.h>
-#include <mmsystem.h>          // timeBeginPeriod: real 1-2 ms pacing during the polish rewrite
 #include <shlobj.h>            // startup-folder shortcut (per-user, no scripts, no registry Run key)
 #include <shobjidl.h>          // IShellLinkW
 #include <objbase.h>           // CoInitializeEx for the shortcut writer
@@ -2217,79 +2216,7 @@ static DWORD WINAPI PolishInitThread(LPVOID)
     return 0;
 }
 
-// ---------------------------------------------------------------- clipboard (borrow for paste)
-// The polish rewrite needs the polished text on the clipboard for exactly one Ctrl+V. The
-// user's own clipboard is snapshotted first and restored after the target has read ours.
-// Only global-memory formats are copied (that is everything a dictation target ever holds:
-// text, HTML, RTF); exotic handle formats are skipped and reported.
-struct ClipBlob { UINT fmt; std::vector<BYTE> bytes; };
-
-static bool ClipboardOpenRetry()
-{
-    for (int i = 0; i < 8; ++i) {
-        if (OpenClipboard(nullptr)) return true;
-        Sleep(40);
-    }
-    return false;
-}
-
-static bool ClipboardSnapshot(std::vector<ClipBlob>& out)
-{
-    if (!ClipboardOpenRetry()) return false;
-    for (UINT fmt = EnumClipboardFormats(0); fmt != 0; fmt = EnumClipboardFormats(fmt)) {
-        HANDLE h = GetClipboardData(fmt);
-        if (!h) continue;
-        SIZE_T n = GlobalSize(h);
-        if (n == 0 || n > 64u * 1024u * 1024u) continue;   // non-memory or absurd: skip
-        void* p = GlobalLock(h);
-        if (p) {
-            out.push_back({ fmt, std::vector<BYTE>((BYTE*)p, (BYTE*)p + n) });
-            GlobalUnlock(h);
-        }
-    }
-    CloseClipboard();
-    return true;
-}
-
-static bool ClipboardSetPlainText(const std::wstring& text)
-{
-    if (!ClipboardOpenRetry()) return false;
-    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
-    if (!h) { CloseClipboard(); return false; }
-    memcpy(GlobalLock(h), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
-    GlobalUnlock(h);
-    BOOL ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, h);
-    CloseClipboard();   // success: system owns h; failure: leaked one buffer, not worth chasing
-    return ok != FALSE;
-}
-
-static void ClipboardRestore(const std::vector<ClipBlob>& blobs)
-{
-    if (blobs.empty()) return;
-    if (!ClipboardOpenRetry()) { Log(L"WARN", L"clipboard: restore failed, polished text left on clipboard"); return; }
-    EmptyClipboard();
-    for (const auto& b : blobs) {
-        HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, b.bytes.size());
-        if (!h) continue;
-        memcpy(GlobalLock(h), b.bytes.data(), b.bytes.size());
-        GlobalUnlock(h);
-        if (!SetClipboardData(b.fmt, h)) GlobalFree(h);
-    }
-    CloseClipboard();
-}
-
-// Replace the last `nchars` characters of the target's text with `polished` in one atomic
-// paste: borrow the clipboard, extend a selection backwards over the dictated span, paste.
-// Selection is batched into single SendInput arrays — it erases nothing, so a lost or extra
-// Left only shifts the selection edge, and focus loss mid-burst leaves the user's text
-// completely intact (worst case: something still highlighted). Returns false only when the
-// clipboard could not be borrowed at all, in which case nothing was touched.
-// ---- Instant span selection (Rev 26) ---------------------------------------
-// Injected Shift+Left makes the target repaint the highlight at every step --
-// the same slow crawl the user just learned to fear. Instead let the target
-// select the span in ONE atomic act: classic edit messages for RichEdit
-// controls, UI Automation's Text pattern for everything modern, and only then
-// the keystroke burst as last resort.
+// ---- Span selection helper ---------------------------------------------------
 static HWND FocusedEditOf(HWND target)
 {
     HWND fg = GetForegroundWindow();
@@ -2301,186 +2228,58 @@ static HWND FocusedEditOf(HWND target)
     return fg;
 }
 
-static bool SelectViaRichEdit(HWND target, size_t n)
+// ---- One-shot replace for Win32 EDIT / RichEdit (the only rewrite path) -----
+// EM_EXSETSEL + EM_REPLACESEL replaces the dictated span inside the control's
+// own thread in two back-to-back messages: no clipboard borrow, no key
+// injection. Because the set-select and replace are queued together, the
+// control never has to paint the intermediate selection - the user sees raw
+// text become polished text in one update.
+// Returns false for any control that is not a classic edit window, for a live
+// foreign selection, or when the target is hung; the text is then left as typed.
+static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring& polished)
 {
+    if (g_polishCancel) return false;
+    if (!IsWindow(target)) return false;
     HWND ed = FocusedEditOf(target);
     if (!ed) return false;
     wchar_t cls[40] = {};
     if (!GetClassNameW(ed, cls, 40)) return false;
     for (size_t i = 0; cls[i]; ++i)
         if (cls[i] >= L'A' && cls[i] <= L'Z') cls[i] = wchar_t(cls[i] - L'A' + L'a');
-    if (!wcsstr(cls, L"richedit")) return false;   // RICHEDIT50W, RichEditD2DPT, ...
-    LRESULT r;
-    CHARRANGE cr = {};
-    r = SendMessageTimeoutW(ed, EM_EXGETSEL, 0, (LPARAM)&cr, SMTO_ABORTIFHUNG, 200, nullptr);
-    if (!r || cr.cpMin != cr.cpMax || cr.cpMin < 0) return false;   // caret only, no live selection
-    if ((size_t)cr.cpMin < n) return false;
-    CHARRANGE sel = { cr.cpMin - (LONG)n, cr.cpMin };
-    r = SendMessageTimeoutW(ed, EM_EXSETSEL, 0, (LPARAM)&sel, SMTO_ABORTIFHUNG, 200, nullptr);
-    if (!r) return false;
-    CHARRANGE back = {};
-    r = SendMessageTimeoutW(ed, EM_EXGETSEL, 0, (LPARAM)&back, SMTO_ABORTIFHUNG, 200, nullptr);
-    if (r && back.cpMax - back.cpMin == (LONG)n) return true;
-    CHARRANGE restore = { cr.cpMin, cr.cpMin };   // undo a partial attempt before falling back
-    SendMessageTimeoutW(ed, EM_EXSETSEL, 0, (LPARAM)&restore, SMTO_ABORTIFHUNG, 200, nullptr);
-    return false;
-}
-
-static bool SelectViaUIA(HWND target, size_t n)
-{
-    static IUIAutomation* uia = nullptr;
-    static bool uiaTried = false;
-    if (!uiaTried) {
-        uiaTried = true;
-        HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (SUCCEEDED(ci) || ci == RPC_E_CHANGED_MODE)
-            CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
-                             IID_PPV_ARGS(&uia));
+    const bool rich = wcsstr(cls, L"richedit") != nullptr;
+    const bool edit = !rich && wcscmp(cls, L"edit") == 0;
+    if (!rich && !edit) return false;
+    if (rich) {
+        CHARRANGE cr = {};
+        if (!SendMessageTimeoutW(ed, EM_EXGETSEL, 0, (LPARAM)&cr, SMTO_ABORTIFHUNG, 200, nullptr)) return false;
+        if (cr.cpMin != cr.cpMax || cr.cpMin < 0 || (size_t)cr.cpMin < nchars) return false;
+        CHARRANGE sel = { cr.cpMin - (LONG)nchars, cr.cpMin };
+        DWORD_PTR r = 0;
+        // Suspend redraw so the set-select never paints: the control draws once,
+        // showing the polished text. Redraw is always re-enabled below.
+        SendMessageTimeoutW(ed, WM_SETREDRAW, FALSE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+        BOOL setOk = (SendMessageTimeoutW(ed, EM_EXSETSEL, 0, (LPARAM)&sel, SMTO_ABORTIFHUNG, 200, &r) != 0) && r;
+        BOOL repOk = FALSE;
+        if (setOk)
+            repOk = SendMessageTimeoutW(ed, EM_REPLACESEL, FALSE, (LPARAM)polished.c_str(),
+                                        SMTO_ABORTIFHUNG, 1000, nullptr) != 0;
+        SendMessageTimeoutW(ed, WM_SETREDRAW, TRUE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+        RedrawWindow(ed, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        return repOk != FALSE;
     }
-    if (!uia) return false;
-    IUIAutomationElement* el = nullptr;
-    if (FAILED(uia->GetFocusedElement(&el)) || !el) return false;
-    bool ok = false;
-    IUnknown* pat = nullptr;
-    IUIAutomationTextPattern* tp = nullptr;
-    IUIAutomationTextRangeArray* arr = nullptr;
-    IUIAutomationTextRange* rng = nullptr;
-    do {
-        UIA_HWND hh = 0;
-        if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
-            HWND eh = (HWND)(INT_PTR)hh;
-            if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) break;
-        }
-        HWND fg = GetForegroundWindow();
-        if (fg != target && !IsChild(target, fg)) break;
-        if (FAILED(el->GetCurrentPattern(UIA_TextPatternId, &pat)) || !pat) break;
-        if (FAILED(pat->QueryInterface(IID_PPV_ARGS(&tp)))) break;
-        if (FAILED(tp->GetSelection(&arr)) || !arr) break;
-        int len = 0;
-        if (FAILED(arr->get_Length(&len)) || len < 1) break;
-        if (FAILED(arr->GetElement(0, &rng)) || !rng) break;
-        int moved = 0;
-        if (FAILED(rng->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character,
-                                           -(int)n, &moved))) break;
-        if (moved != -(int)n) break;                   // provider counts differently; don't risk it
-        if (FAILED(rng->Select())) break;
-        ok = true;
-    } while (false);
-    if (rng) rng->Release();
-    if (arr) arr->Release();
-    if (tp) tp->Release();
-    if (pat) pat->Release();
-    el->Release();
-    return ok;
-}
-
-static bool SelectInstant(HWND target, size_t n)
-{
-    if (SelectViaRichEdit(target, n)) {
-        Log(L"INFO", L"polish: span selected in one shot (richedit message)");
-        return true;
-    }
-    if (SelectViaUIA(target, n)) {
-        Log(L"INFO", L"polish: span selected in one shot (UI text pattern)");
-        return true;
-    }
-    Log(L"INFO", L"polish: instant selection unavailable; falling back to key burst");
-    return false;
-}
-
-static bool RewriteViaPaste(HWND target, size_t nchars, const std::wstring& polished)
-{
-    std::vector<ClipBlob> snap;
-    ClipboardSnapshot(snap);
-    if (!ClipboardSetPlainText(polished)) { ClipboardRestore(snap); return false; }
-
-    const WORD scLeft = (WORD)MapVirtualKeyW(VK_LEFT, MAPVK_VK_TO_VSC);
-    bool aborted = false;
-    bool focusGone = false;
-    const bool instant = SelectInstant(target, nchars);
-    timeBeginPeriod(1);
-    if (instant) {
-        // The target already holds the selection; one last focus check and paste.
-        if (g_polishCancel || !IsWindow(target) ||
-            (GetForegroundWindow() != target && !IsChild(target, GetForegroundWindow()))) {
-            aborted = true;
-            focusGone = g_polishCancel ? false : true;
-        }
-    } else {
-    INPUT shDown{}; shDown.type = INPUT_KEYBOARD;
-    shDown.ki.wVk = VK_SHIFT; shDown.ki.wScan = 0x2A;
-    SendInput(1, &shDown, sizeof(INPUT));
-    size_t sent = 0;
-    while (sent < nchars) {
-        if (g_polishCancel || !IsWindow(target) ||
-            (GetForegroundWindow() != target && !IsChild(target, GetForegroundWindow()))) {
-            aborted = true;
-            focusGone = g_polishCancel ? false : true;
-            break;
-        }
-        size_t chunk = (nchars - sent > 64) ? 64 : (nchars - sent);
-        INPUT ev[128];
-        size_t k = 0;
-        for (size_t i = 0; i < chunk; ++i) {
-            INPUT& d = ev[k++]; d = {}; d.type = INPUT_KEYBOARD;
-            d.ki.wVk = VK_LEFT; d.ki.wScan = scLeft; d.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-            INPUT& u = ev[k++]; u = d; u.ki.dwFlags |= KEYEVENTF_KEYUP;
-        }
-        SendInput((UINT)k, ev, sizeof(INPUT));
-        sent += chunk;
-    }
-    INPUT shUp{}; shUp.type = INPUT_KEYBOARD;
-    shUp.ki.wVk = VK_SHIFT; shUp.ki.wScan = 0x2A; shUp.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &shUp, sizeof(INPUT));
-    }
-
-    bool ok = false;
-    if (!aborted) {
-        INPUT pv[4]{};
-        pv[0].type = INPUT_KEYBOARD; pv[0].ki.wVk = VK_CONTROL; pv[0].ki.wScan = 0x1D;
-        pv[1] = pv[0]; pv[1].ki.wVk = 0x56; pv[1].ki.wScan = 0x2F;   // VK_V
-        pv[2] = pv[1]; pv[2].ki.dwFlags = KEYEVENTF_KEYUP;
-        pv[3] = pv[0]; pv[3].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(4, pv, sizeof(INPUT));
-        ok = true;
-        Sleep(600);   // the target must read the clipboard during paste; restore only after
-    } else if (!focusGone) {
-        INPUT rg{}; rg.type = INPUT_KEYBOARD;
-        rg.ki.wVk = VK_RIGHT; rg.ki.wScan = (WORD)MapVirtualKeyW(VK_RIGHT, MAPVK_VK_TO_VSC);
-        rg.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
-        INPUT ru = rg; ru.ki.dwFlags |= KEYEVENTF_KEYUP;
-        INPUT collapse[2] = { rg, ru };
-        SendInput(2, collapse, sizeof(INPUT));   // drop the dangling highlight
-    }
-    timeEndPeriod(1);
-    ClipboardRestore(snap);
-    if (aborted)
-        Log(L"WARN", focusGone
-            ? L"polish: focus lost while selecting; nothing was rewritten, text intact"
-            : L"polish: cancelled while selecting; nothing was rewritten, text intact");
-    return ok;
-}
-
-// Old mechanism, kept only as the no-clipboard fallback: paced backspaces then paced retype.
-static void RewriteViaBackspace(HWND target, const std::wstring& raw, const std::wstring& polished)
-{
-    timeBeginPeriod(1);              // without this, Sleep(2) really sleeps ~15 ms
-    for (size_t i = 0; i < raw.size(); ++i) {
-        if (g_polishCancel || !IsWindow(target) ||
-            (GetForegroundWindow() != target && !IsChild(target, GetForegroundWindow()))) {
-            timeEndPeriod(1);
-            Log(L"WARN", L"polish: interrupted mid-replacement; the text may be partially rewritten");
-            return;
-        }
-        INPUT in[2]{};
-        in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = VK_BACK;
-        in[0].ki.wScan = 0x0E;   // Chromium-family targets key off the scan code
-        in[1] = in[0]; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, in, sizeof(INPUT));
-        Sleep(2);                // rapid-fire injected keys are dropped by some targets
-    }
-    SendUnicode(polished, 2);    // paced: a lost keystroke here is a corrupted message
-    timeEndPeriod(1);
+    DWORD sel = 0;
+    if (!SendMessageTimeoutW(ed, EM_GETSEL, 0, (LPARAM)&sel, SMTO_ABORTIFHUNG, 200, nullptr)) return false;
+    DWORD start = LOWORD(sel), end = HIWORD(sel);
+    if (start != end || start < nchars) return false;
+    SendMessageTimeoutW(ed, WM_SETREDRAW, FALSE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+    BOOL setOk = SendMessageTimeoutW(ed, EM_SETSEL, start - (UINT)nchars, (LPARAM)start, SMTO_ABORTIFHUNG, 200, nullptr) != 0;
+    BOOL repOk = FALSE;
+    if (setOk)
+        repOk = SendMessageTimeoutW(ed, EM_REPLACESEL, FALSE, (LPARAM)polished.c_str(),
+                                    SMTO_ABORTIFHUNG, 1000, nullptr) != 0;
+    SendMessageTimeoutW(ed, WM_SETREDRAW, TRUE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
+    RedrawWindow(ed, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    return repOk != FALSE;
 }
 
 struct PolishJob { HWND target; std::wstring text; };
@@ -2509,18 +2308,20 @@ static DWORD WINAPI PolishThread(LPVOID p)
         Log(L"INFO", L"polish: target window is no longer foreground, text left as typed");
         delete job; return 0;
     }
-    // Replace in one atomic paste (borrow the clipboard, select, Ctrl+V). If the clipboard
-    // cannot be borrowed at all, fall back to the old paced backspace-and-retype.
+    // One rewrite path only: EM_REPLACESEL into a classic edit/RichEdit control, which
+    // updates the control inside its own thread without ever painting a selection.
+    // Targets that do not expose such a control (Chromium, WinUI) are left untouched —
+    // rewriting them would require keystroke bursts or clipboard borrowing, both removed.
     ULONGLONG t1 = GetTickCount64();
-    bool pasted = RewriteViaPaste(job->target, job->text.size(), out);
-    if (!pasted) {
-        Log(L"WARN", L"polish: clipboard unavailable, falling back to backspace rewrite");
-        RewriteViaBackspace(job->target, job->text, out);
-    }
+    bool oneShot = RewriteViaReplaceSel(job->target, job->text.size(), out);
     ULONGLONG dt2 = GetTickCount64() - t1;
-    swprintf_s(b, L"polish: %zu chars -> %zu via %ls in %llu ms (model %llu ms)",
-               job->text.size(), out.size(), pasted ? L"paste" : L"backspace",
-               (unsigned long long)dt2, (unsigned long long)dt);
+    if (oneShot)
+        swprintf_s(b, L"polish: %zu chars -> %zu via replace-sel in %llu ms (model %llu ms)",
+                   job->text.size(), out.size(),
+                   (unsigned long long)dt2, (unsigned long long)dt);
+    else
+        swprintf_s(b, L"polish: target does not support one-shot replace; text left as typed (model %llu ms)",
+                   (unsigned long long)dt);
     Log(L"INFO", b);
     delete job;
     return 0;
@@ -3118,16 +2919,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; ++i) {
         if (debug && !_wcsicmp(argv[i], L"--rewrite-demo")) {
-            // Headless end-to-end check of the borrow-clipboard rewrite against a plain
-            // Win32 EDIT control that Tiro owns: seed the user clipboard with a sentinel,
-            // type raw text, rewrite it via paste, read the control back, and verify both
-            // the final text and that the sentinel came back. (Win11 Notepad is a WinUI
-            // app whose window cannot be driven or read this way — a standard EDIT can.)
-            const wchar_t* raw = L"hello world this is raw";
-            const wchar_t* pol = L"Hello world. This is raw.";
-            if (!ClipboardSetPlainText(L"SENTINEL-123"))
-                Log(L"ERROR", L"rewrite-demo: cannot seed clipboard");
+            // End-to-end check of the one-shot rewrite against a RICHEDIT50W control
+            // that Tiro owns (Win11 Notepad is WinUI and cannot be driven or read this
+            // way; a classic edit window can).
             Log(L"INFO", L"rewrite-demo: begin");
+            const wchar_t* raw = L"hello world this is raw dictated text without any punctuation at all and it keeps going because short text would hide the selection crawl that a user actually sees when they dictate a real paragraph into an application on their machine today";
+            const wchar_t* pol = L"Hello world. This is raw dictated text without any punctuation at all, and it keeps going because short text would hide the selection crawl that a user actually sees when they dictate a real paragraph into an application on their machine today.";
             // The real tray window's IDT_LOAD timer would otherwise fire inside our pumps and
             // boot the ASR engine under the demo; silence it.
             KillTimer(g.hwnd, IDT_LOAD);
@@ -3192,7 +2989,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             ULONGLONG t0 = GetTickCount64();
             HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
                 RWJob* j = (RWJob*)p;
-                j->ok = RewriteViaPaste(j->top, j->n, j->pol);
+                j->ok = RewriteViaReplaceSel(j->top, j->n, j->pol);
+                Log(j->ok ? L"INFO" : L"ERROR",
+                    j->ok ? L"rewrite-demo: replaced via EM_REPLACESEL"
+                          : L"rewrite-demo: EM_REPLACESEL failed on own control");
                 return 0; }, &job, 0, nullptr);
             Pump(1500);
             if (th) { WaitForSingleObject(th, 5000); CloseHandle(th); }
@@ -3206,21 +3006,83 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             Log(L"INFO", eb);
             wchar_t got[256] = L"(empty)";
             SendMessageW(ed, WM_GETTEXT, 255, (LPARAM)got);
-            std::wstring clip;
-            if (OpenClipboard(nullptr)) {
-                HANDLE h = GetClipboardData(CF_UNICODETEXT);
-                if (h) { wchar_t* p = (wchar_t*)GlobalLock(h); if (p) clip = p; if (p) GlobalUnlock(h); }
-                CloseClipboard();
-            }
             bool textOk = wcscmp(got, pol) == 0;
-            bool clipOk = clip == L"SENTINEL-123";
             wchar_t b[512];
-            swprintf_s(b, L"rewrite-demo: %ls | edit=\"%ls\" | clipboard=\"%ls\" | fg=%ls | paste-rewrite %s in %llu ms",
-                       (textOk && clipOk) ? L"PASS" : L"FAIL", got, clip.c_str(), fg,
+            swprintf_s(b, L"rewrite-demo: %ls | edit=\"%ls\" | fg=%ls | rewrite %s in %llu ms",
+                       (textOk && ok) ? L"PASS" : L"FAIL", got, fg,
                        ok ? L"ok" : L"failed", ms);
-            Log(textOk && clipOk ? L"INFO" : L"ERROR", b);
+            Log(textOk && ok ? L"INFO" : L"ERROR", b);
             DestroyWindow(top);
             if (argv) LocalFree(argv);
+            CoUninitialize();
+            return 0;
+        }
+        if (debug && !_wcsicmp(argv[i], L"--probe-focus")) {
+            // Read-only interrogation of the control that currently has keyboard focus,
+            // so a test harness can record which rewrite path each target supports.
+            // Waits 2.5 s first: the harness focuses the target, then runs this.
+            // Modifies nothing - only GET/query messages are sent.
+            Sleep(2500);
+            HWND top = GetForegroundWindow();
+            if (!top) { Log(L"ERROR", L"probe: no foreground window"); return 0; }
+            wchar_t topCls[80] = L"?", topTtl[160] = L"", proc[160] = L"?";
+            GetClassNameW(top, topCls, 80);
+            GetWindowTextW(top, topTtl, 160);
+            DWORD pid = 0; GetWindowThreadProcessId(top, &pid);
+            { HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+              if (hp) { DWORD n = 160; QueryFullProcessImageNameW(hp, 0, proc, &n); CloseHandle(hp); } }
+            HWND ed = FocusedEditOf(top);
+            wchar_t edCls[80] = L"(none)";
+            if (ed) GetClassNameW(ed, edCls, 80);
+            wchar_t b[512];
+            swprintf_s(b, L"probe: fg=\"%ls\" [%ls] proc=%ls pid=%lu focused=%ls",
+                       topTtl, topCls, wcsrchr(proc, L'\\') ? wcsrchr(proc, L'\\') + 1 : proc, pid, edCls);
+            Log(L"INFO", b);
+            // Classic edit messages (read-only).
+            BOOL richLike = FALSE, editLike = FALSE;
+            for (wchar_t* p = edCls; *p; ++p) *p = towlower(*p);
+            if (ed) {
+                if (wcsstr(edCls, L"richedit")) richLike = TRUE;
+                else if (wcscmp(edCls, L"edit") == 0) editLike = TRUE;
+            }
+            if (ed && (richLike || editLike)) {
+                DWORD_PTR res = 0;
+                BOOL alive = SendMessageTimeoutW(ed, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 200, &res) != 0;
+                DWORD sel = 0; BOOL r = SendMessageTimeoutW(ed, EM_GETSEL, 0, (LPARAM)&sel, SMTO_ABORTIFHUNG, 200, nullptr) != 0;
+                swprintf_s(b, L"probe: edit msgs alive=%d textlen=%lu caret=%u", alive, (unsigned long)res, r ? LOWORD(sel) : 0);
+                Log(L"INFO", b);
+            }
+            // UIA patterns on the focused element.
+            BOOL hasText = FALSE, hasValue = FALSE, valueRO = TRUE;
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            IUIAutomation* uia = nullptr;
+            if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                                           IID_PPV_ARGS(&uia)))) {
+                IUIAutomationElement* el = nullptr;
+                if (SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+                    IUnknown* p = nullptr;
+                    if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId, &p))) { hasText = TRUE; p->Release(); }
+                    p = nullptr;
+                    if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId, &p))) {
+                        hasValue = TRUE;
+                        IUIAutomationValuePattern* vp = nullptr;
+                        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&vp)))) { vp->get_CurrentIsReadOnly(&valueRO); vp->Release(); }
+                        p->Release();
+                    }
+                    el->Release();
+                }
+                uia->Release();
+            }
+            swprintf_s(b, L"probe: uia TextPattern=%d ValuePattern=%d%s", hasText, hasValue,
+                       hasValue ? (valueRO ? L" (readonly)" : L" (writable)") : L"");
+            Log(L"INFO", b);
+            // Verdict: whether the one-shot rewrite would apply to this target.
+            const wchar_t* verdict =
+                (richLike || editLike) ? L"one-shot EM_REPLACESEL applies"
+                                       : L"unsupported - text will be left as typed";
+            swprintf_s(b, L"probe: verdict=%ls", verdict);
+            Log(L"INFO", b);
+            wprintf(L"%s\n", b);
             CoUninitialize();
             return 0;
         }
@@ -3284,6 +3146,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                            !_wcsicmp(argv[i], L"--notify") || !_wcsicmp(argv[i], L"--startup-toggle") ||
                            !_wcsicmp(argv[i], L"--restart") || !_wcsicmp(argv[i], L"--selftest") ||
                            !_wcsicmp(argv[i], L"--live") || !_wcsicmp(argv[i], L"--rewrite-demo") ||
+                           !_wcsicmp(argv[i], L"--probe-focus") ||
                            !_wcsicmp(argv[i], L"--polish-file") || !_wcsicmp(argv[i], L"--polish-tokens");
         if (!debug) {
             if (known)
