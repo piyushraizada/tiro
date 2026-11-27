@@ -582,10 +582,15 @@ With `Polish=1`, a second ONNX model at `models\punctuation\`
 restored at word ends, sentence starts capitalised, standalone "i" → "I",
 whitespace collapsed, 400-token windows with 50-token overlap — and the target is
 updated in one act: for classic `EDIT`/`RichEdit` controls, `EM_EXSETSEL` plus
-`EM_REPLACESEL` are queued back-to-back so the control replaces the dictated span
-inside its own thread without ever painting a selection. Targets that do not
-expose such a control (Chromium-family, WinUI) are left exactly as typed; Tiro
-never borrows the clipboard and never sends backspace or selection keystrokes.
+`EM_REPLACESEL` are queued back-to-back with redraw suspended, so the control
+replaces the dictated span inside its own thread without ever painting a
+selection. Chromium/Electron/WinUI inputs that expose a writable UIA
+`ValuePattern` are rewritten in one `SetValue` call, applied only after the raw
+span is verified to sit exactly where the caret left it; Tiro then waits for the
+accessibility tree to report the new value and places the caret at the end of
+the polished span, so dictation can continue from there. Targets matching
+neither are left exactly as typed; Tiro never borrows the clipboard and never
+sends backspace or selection keystrokes.
 
 Failure is always safe: if the model is not ready, the output is empty, the
 target is no longer foreground, the target does not support the one-shot
@@ -973,9 +978,18 @@ Scenario: The rewrite lands in one step
   And no selection highlight is ever painted
   And the log records "polish: <a> chars -> <b> chars via replace-sel in <n> ms"
 
+Scenario: Chromium rewrite leaves the caret ready for more dictation
+  Given punctuation is enabled and ready
+  And the target exposes a writable UIA value pattern
+  When the user stops dictating with the hotkey
+  Then the dictated span is replaced in one act
+  And the caret sits immediately after the last polished character
+  And the user can continue dictating from that point
+  And the log records "polish: <a> chars -> <b> chars via uia-value in <n> ms"
+
 Scenario: An unsupported target keeps its text
   Given punctuation is enabled and ready
-  And the target is a Chromium or WinUI control
+  And the target exposes neither a classic edit control nor a writable UIA value pattern
   When the user stops dictating with the hotkey
   Then the dictated text remains exactly as injected
   And the log records "polish: target does not support one-shot replace"

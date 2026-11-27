@@ -2228,7 +2228,7 @@ static HWND FocusedEditOf(HWND target)
     return fg;
 }
 
-// ---- One-shot replace for Win32 EDIT / RichEdit (the only rewrite path) -----
+// ---- One-shot replace for Win32 EDIT / RichEdit -----------------------------
 // EM_EXSETSEL + EM_REPLACESEL replaces the dictated span inside the control's
 // own thread in two back-to-back messages: no clipboard borrow, no key
 // injection. Because the set-select and replace are queued together, the
@@ -2282,6 +2282,156 @@ static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring&
     return repOk != FALSE;
 }
 
+// ---- One-shot replace via UIA ValuePattern (Chromium / Electron / WinUI) -----
+// Writable inputs that are not classic edit windows still accept a whole-value
+// SetValue through UI Automation: read the current value, splice the polished
+// span over the raw span, write the whole string back in one call. No clipboard,
+// no keystrokes, no painted selection. Safe by construction: the write happens
+// only after the raw span is found exactly where the caret left it; anything
+// unexpected (user typed on, provider reports a different value) aborts and the
+// text is left exactly as injected.
+static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::wstring& polished)
+{
+    if (g_polishCancel) return false;
+    if (!IsWindow(target) || raw.empty()) return false;
+    HWND fg = GetForegroundWindow();
+    if (fg != target && !IsChild(target, fg)) return false;
+
+    static IUIAutomation* uia = nullptr;
+    static bool uiaTried = false;
+    if (!uiaTried) {
+        uiaTried = true;
+        HRESULT ci = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (SUCCEEDED(ci) || ci == RPC_E_CHANGED_MODE)
+            CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                             IID_PPV_ARGS(&uia));
+    }
+    if (!uia) return false;
+
+    bool ok = false;
+    IUIAutomationElement* el = nullptr;
+    IUnknown* pVal = nullptr; IUnknown* pTxt = nullptr;
+    IUIAutomationValuePattern* vp = nullptr;
+    IUIAutomationTextPattern* tp = nullptr;
+    IUIAutomationTextRangeArray* arr = nullptr;
+    IUIAutomationTextRange* sel = nullptr;
+    IUIAutomationTextRange* doc = nullptr;
+    IUIAutomationTextRange* pre = nullptr;
+    IUIAutomationTextRange* post = nullptr;
+    BSTR bstr = nullptr;
+    do {
+        if (FAILED(uia->GetFocusedElement(&el)) || !el) break;
+        UIA_HWND hh = 0;
+        if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
+            HWND eh = (HWND)(INT_PTR)hh;
+            if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) break;
+        }
+        if (FAILED(el->GetCurrentPattern(UIA_ValuePatternId, &pVal)) || !pVal) break;
+        if (FAILED(pVal->QueryInterface(IID_PPV_ARGS(&vp)))) break;
+        BOOL ro = TRUE;
+        if (FAILED(vp->get_CurrentIsReadOnly(&ro)) || ro) break;
+        if (FAILED(el->GetCurrentPattern(UIA_TextPatternId, &pTxt)) || !pTxt) break;
+        if (FAILED(pTxt->QueryInterface(IID_PPV_ARGS(&tp)))) break;
+
+        // Locate the dictated span: UIA selection must equal the raw text.
+        if (FAILED(tp->GetSelection(&arr)) || !arr) break;
+        int n = 0;
+        if (FAILED(arr->get_Length(&n)) || n != 1) break;
+        // Caret gives an empty selection: fall back to the point right before it.
+        if (FAILED(arr->GetElement(0, &sel)) || !sel) break;
+        if (FAILED(sel->GetText(-1, &bstr))) break;
+        std::wstring selText = bstr ? bstr : L"";
+        SysFreeString(bstr); bstr = nullptr;
+        if (selText != raw) {
+            // Providers usually report the caret as a collapsed range; rebuild the
+            // span by walking back raw.size() characters from the caret.
+            IUIAutomationTextRange* caret = nullptr;
+            if (FAILED(sel->Clone(&caret)) || !caret) break;
+            int moved = 0;
+            if (FAILED(caret->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character,
+                                                 -(int)raw.size(), &moved)) || moved != -(int)raw.size()) {
+                caret->Release(); break;
+            }
+            sel->Release();
+            sel = caret;
+            if (FAILED(sel->GetText(-1, &bstr))) break;
+            selText = bstr ? bstr : L"";
+            SysFreeString(bstr); bstr = nullptr;
+            if (selText != raw) break;   // user moved on; leave it alone
+        }
+
+        // Splice: value must be exactly [before][raw][after].
+        if (FAILED(tp->get_DocumentRange(&doc)) || !doc) break;
+        IUIAutomationTextRange* preR = nullptr; IUIAutomationTextRange* postR = nullptr;
+        if (FAILED(doc->Clone(&preR)) || FAILED(doc->Clone(&postR))) {
+            if (preR) preR->Release(); if (postR) postR->Release(); break;
+        }
+        pre = preR; post = postR;
+        if (FAILED(pre->MoveEndpointByRange(TextPatternRangeEndpoint_End, sel, TextPatternRangeEndpoint_Start))) break;
+        if (FAILED(post->MoveEndpointByRange(TextPatternRangeEndpoint_Start, sel, TextPatternRangeEndpoint_End))) break;
+        if (FAILED(pre->GetText(-1, &bstr))) break;
+        std::wstring before = bstr ? bstr : L""; SysFreeString(bstr); bstr = nullptr;
+        if (FAILED(post->GetText(-1, &bstr))) break;
+        std::wstring after = bstr ? bstr : L""; SysFreeString(bstr); bstr = nullptr;
+        if (FAILED(vp->get_CurrentValue(&bstr))) break;
+        std::wstring cur = bstr ? bstr : L""; SysFreeString(bstr); bstr = nullptr;
+        if (cur != before + raw + after) break;   // provider disagrees with the text model; abort
+
+        std::wstring nv = before + polished + after;
+        BSTR nvB = SysAllocString(nv.c_str());
+        HRESULT setHr = nvB ? vp->SetValue(nvB) : E_OUTOFMEMORY;
+        if (nvB) SysFreeString(nvB);
+        if (FAILED(setHr)) break;
+        ok = true;
+
+        // Whole-value writes leave the caret wherever the provider likes, and the
+        // accessibility tree refreshes asynchronously. Poll the fresh document
+        // range until it reports the new value, then walk back over the untouched
+        // tail and select the zero-length range: caret lands right after the
+        // polished span so dictation can continue from there.
+        ULONGLONG caretT0 = GetTickCount64();
+        for (int attempt = 0; GetTickCount64() - caretT0 < 1000; ++attempt) {
+            IUIAutomationTextRange* doc2 = nullptr;
+            if (FAILED(tp->get_DocumentRange(&doc2)) || !doc2) break;
+            BSTR dv = nullptr;
+            std::wstring docTxt;
+            if (SUCCEEDED(doc2->GetText(-1, &dv))) docTxt = dv ? dv : L"";
+            if (dv) SysFreeString(dv);
+            bool settled = (docTxt == nv);
+            if (settled) {
+                IUIAutomationTextRange* caret = nullptr;
+                if (SUCCEEDED(doc2->Clone(&caret)) && caret) {
+                    caret->MoveEndpointByRange(TextPatternRangeEndpoint_Start, doc2,
+                                               TextPatternRangeEndpoint_End);
+                    int mv = 0;
+                    caret->MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character,
+                                              -(int)after.size(), &mv);
+                    caret->MoveEndpointByRange(TextPatternRangeEndpoint_End, caret,
+                                               TextPatternRangeEndpoint_Start);
+                    if (mv == -(int)after.size()) caret->Select();
+                    caret->Release();
+                }
+                doc2->Release();
+                break;
+            }
+            doc2->Release();
+            Sleep(40);
+        }
+    } while (false);
+    if (bstr) SysFreeString(bstr);
+    if (pre) pre->Release();
+    if (post) post->Release();
+    if (doc) doc->Release();
+    if (sel) sel->Release();
+    if (arr) arr->Release();
+    if (tp) tp->Release();
+    if (pTxt) pTxt->Release();
+    if (vp) vp->Release();
+    if (pVal) pVal->Release();
+    if (el) el->Release();
+    return ok;
+}
+
 struct PolishJob { HWND target; std::wstring text; };
 
 static DWORD WINAPI PolishThread(LPVOID p)
@@ -2308,16 +2458,28 @@ static DWORD WINAPI PolishThread(LPVOID p)
         Log(L"INFO", L"polish: target window is no longer foreground, text left as typed");
         delete job; return 0;
     }
-    // One rewrite path only: EM_REPLACESEL into a classic edit/RichEdit control, which
-    // updates the control inside its own thread without ever painting a selection.
-    // Targets that do not expose such a control (Chromium, WinUI) are left untouched —
-    // rewriting them would require keystroke bursts or clipboard borrowing, both removed.
+    // Two one-shot paths, no keystrokes and no clipboard anywhere:
+    // EM_REPLACESEL for classic edit/RichEdit controls; UIA ValuePattern.SetValue
+    // for Chromium/Electron/WinUI inputs that expose a writable value. If neither
+    // applies the text is left exactly as typed and the log says so.
     ULONGLONG t1 = GetTickCount64();
     bool oneShot = RewriteViaReplaceSel(job->target, job->text.size(), out);
+    const wchar_t* via = L"replace-sel";
+    if (!oneShot) {
+        oneShot = RewriteViaUIAValue(job->target, job->text, out);
+        via = L"uia-value";
+    }
     ULONGLONG dt2 = GetTickCount64() - t1;
+    {
+        // Raw in / polished out, verbatim, for drift diagnosis: the delta between
+        // ASR-supplied punctuation and model-supplied punctuation is invisible
+        // otherwise (char-count deltas hide a rewrite that strips as much as it adds).
+        Log(L"INFO", (L"polish raw: " + job->text).c_str());
+        if (oneShot) Log(L"INFO", (L"polish out: " + out).c_str());
+    }
     if (oneShot)
-        swprintf_s(b, L"polish: %zu chars -> %zu via replace-sel in %llu ms (model %llu ms)",
-                   job->text.size(), out.size(),
+        swprintf_s(b, L"polish: %zu chars -> %zu via %ls in %llu ms (model %llu ms)",
+                   job->text.size(), out.size(), via,
                    (unsigned long long)dt2, (unsigned long long)dt);
     else
         swprintf_s(b, L"polish: target does not support one-shot replace; text left as typed (model %llu ms)",
@@ -3079,6 +3241,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             // Verdict: whether the one-shot rewrite would apply to this target.
             const wchar_t* verdict =
                 (richLike || editLike) ? L"one-shot EM_REPLACESEL applies"
+              : hasValue && !valueRO   ? L"one-shot UIA SetValue applies"
                                        : L"unsupported - text will be left as typed";
             swprintf_s(b, L"probe: verdict=%ls", verdict);
             Log(L"INFO", b);
