@@ -1,0 +1,50 @@
+TIRO - NOTICE
+=============
+
+This product includes the NVIDIA Nemotron speech recognition model.
+
+Licensed by NVIDIA Corporation under the NVIDIA Open Model License
+
+  Model:       nvidia/nemotron-speech-streaming-en-0.6b
+  ONNX export: sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8
+  Supplied as int8 ONNX encoder, decoder and joiner, 560 ms streaming chunks.
+
+The full text of the NVIDIA Open Model License is in LICENSE.txt. NVIDIA does
+not endorse this application, and no NVIDIA trademark is used except to
+describe the origin of the model.
+
+--------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+--------------------------------------------------------------------------
+
+sherpa-onnx  v2.0.3  (https://github.com/k2-fsa/sherpa-onnx)
+  Copyright (c) k2-fsa contributors
+  Apache License, Version 2.0 - see LICENSE.txt
+
+ONNX Runtime 1.28.2  (https://github.com/microsoft/onnxruntime)
+  Copyright (c) Microsoft Corporation
+  MIT License - see LICENSE.txt
+  Linked statically as shipped by the sherpa-onnx win-x64 static package
+  (compiled against the 1.20.1 C API header).
+
+Punctuation model: Horizon-Labs/punctuation-restoration-base
+  (https://huggingface.co/Horizon-Labs/punctuation-restoration-base)
+  Copyright 2026 Horizon Labs
+  Apache License, Version 2.0 - see LICENSE.txt, and the model's own NOTICE
+  shipped in models/punctuation/.
+  It is a fine-tune of mmBERT-base
+  (https://huggingface.co/jhu-clsp/mmBERT-base), Copyright (c) the mmBERT
+  authors (Johns Hopkins University CLSP), MIT License - see LICENSE.txt;
+  the full derivation notice is in models/punctuation/NOTICE.
+
+Visual C++ runtime (/MT)
+  Statically linked under the Microsoft Visual Studio licence terms.
+
+--------------------------------------------------------------------------
+ARTWORK
+--------------------------------------------------------------------------
+
+The eyeball animation is an original illustration drawn for this application.
+It is a generic status indicator - a lens, a bezel and a state glow - and
+depicts no third-party character, product or mark. No affiliation with any film,
+studio or rights holder is claimed or implied.

@@ -1,0 +1,18 @@
+NEMOTRON SPEECH MODEL - NOTICE
+==============================
+
+Model:       NVIDIA Nemotron streaming ASR (nemotron-speech-streaming-en-0.6b)
+Export:      sherpa-onnx Nemotron streaming transducer, 560 ms chunks, int8 ONNX
+Source:      https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b
+
+Licensed by NVIDIA Corporation under the NVIDIA Open Model License.
+
+The full text of the NVIDIA Open Model License is in LICENSE.txt beside this
+file (and in the package's root LICENSE.txt).
+
+NVIDIA does not endorse this application. No NVIDIA trademark is used except
+to describe the origin of this model. Outputs generated with the model are
+not claimed by NVIDIA.
+
+This folder must stay together with the application: the licence text above
+travels with the model files.

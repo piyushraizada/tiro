@@ -1,0 +1,38 @@
+# Build output
+bin/
+build/
+Debug/
+Release/
+x64/
+
+# Model weights (633 MB — not source)
+models/
+
+# The speech-engine libraries (1.1 GB unpacked; onnxruntime.lib alone is 944 MB)
+# ship as one 55 MB .tar.xz, which build_release.bat unpacks into third_party.
+# The unpacked folder is what Git ignores; the headers and licences ARE tracked.
+third_party/*
+!third_party/*.tar.xz
+!third_party/include/
+!third_party/include/*
+!third_party/licenses/
+!third_party/licenses/*
+
+# MSVC / VS artefacts
+*.user
+*.aps
+*.obj
+*.pdb
+*.ilk
+*.ipch
+.vs/
+
+# Scratch: recorded captures, logs, Python droppings
+*.wav
+*.log
+
+# Generated at build time by build_release.bat (commit stamp)
+src/gitver.h
+__pycache__/
+*.pyc
+

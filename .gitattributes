@@ -1,0 +1,25 @@
+# Line endings: store everything LF-normalised, but hand Windows tools the CRLF
+# they expect. Without this, a build on a machine with core.autocrlf=true shows
+# every file as modified as soon as an editor or an agent touches it.
+* text=auto
+
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.sln     text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.rc      text eol=crlf
+*.cpp     text eol=crlf
+*.h       text eol=crlf
+
+*.md      text eol=lf
+*.txt     text eol=lf
+
+# Binaries: never convert, never diff.
+*.ico  binary
+*.wav  binary
+*.xz   binary
+*.zip  binary
+*.exe  binary
+*.lib  binary
+*.pdb  binary
