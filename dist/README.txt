@@ -70,10 +70,15 @@ seconds after you stop. It reappearing means Tiro is hearing you again - it
 never took its ears off. Not your style? Right-click the tray icon and check
 "Disable Eyeball Animation" - it will never appear again unless you uncheck it.
 
-Text is typed where your cursor is, exactly as the speech model hears it -
-including its own punctuation, which it adds natively ("hello world. it works."
-arrives with the period in place). Tiro never adds or changes punctuation
-itself during dictation; what you see is what the model heard.
+Text is typed where your cursor is. For punctuation, Tiro decides per
+dictation, per application, who does the punctuating. If the application lets
+Tiro apply a clean one-shot correction, the speech model's own punctuation is
+held back while you dictate and the strict punctuation model rewrites the whole
+sentence once, invisibly, when you stop. If the application does not support
+that, nothing is hidden or rewritten: text arrives exactly as the speech model
+hears it, including its own punctuation ("hello world. it works." arrives with
+the period in place), so you always get at least the punctuation the model
+supplies.
 
 There is an optional second pass that
 re-reads the sentence you just dictated and rewrites punctuation and
