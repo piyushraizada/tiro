@@ -10,7 +10,7 @@ Most voice-to-text tools send your voice recordings to a server (the cloud). Thi
 *   **Runs on CPU Only:** No graphics card (GPU) needed. If you have a normal Windows PC or laptop, Tiro runs on it — nothing to buy, nothing to upgrade.
 *   **No Installation:** No "Admin Rights" or complicated setups. It is a portable application.
 *   **Fast & Fluid:** Designed to keep up with your natural speaking pace.
-*   **Native Punctuation:** The Nemotron model punctuates your speech as it hears it — periods, question marks, commas — out of the box, no settings, no cloud.
+*   **Punctuation, Handled Smartly:** The Nemotron model punctuates your speech as it hears it — periods, question marks, commas — out of the box, no settings, no cloud. With the optional punctuation model, supported applications get a stricter polish that lands in one seamless instant the moment you stop talking.
 *   **Zero Footprint:** It stays out of your way until you need it.
 
 ---
