@@ -1,4 +1,4 @@
-// Tiro - Windows dictation app. Layer 1: tray shell, state machine, menu, dialogs.
+﻿// Tiro - Windows dictation app. Layer 1: tray shell, state machine, menu, dialogs.
 // Spec: requirements_and_bdd.md (Revision 32).
 
 #include <windows.h>
@@ -1243,6 +1243,7 @@ static void MarkSessionBoundary()
 }
 
 static bool g_uttStarted = false;    // anything typed since the last reset
+static wchar_t g_lastInjected = 0;   // last char queued for injection (see QueueInject)
 
 // What the decoder hears is what gets typed. (Rev 28 added a deterministic punctuation
 // middleware here; Rev 31 removed it for the first release - Nemotron's own punctuation
@@ -1494,6 +1495,34 @@ static DWORD WINAPI EngineThread(LPVOID)
                     break;
                 }
                 Sleep(20);
+            }
+            // Speech-mode contract: stopping dictation means a sentence ended
+            // somewhere the user heard one. When the last character typed was a
+            // word character, the sentence is owed its closing period. This goes
+            // through the injector while the drain is still active (after it
+            // releases, the injector refuses all text by design), and the drain
+            // stays open until the period is actually in the document.
+            if (!g_sessionPolish && g_uttStarted) {
+                wchar_t last = 0;
+                { std::lock_guard<std::mutex> il(g_injectMu); last = g_lastInjected; }
+                if (iswalnum(last)) {
+                    QueueInject(L".", false);
+                    Log(L"INFO", L"session end: closing period added");
+                    ULONGLONG pl = GetTickCount64() + 800;
+                    for (;;) {
+                        bool idle = false;
+                        { std::lock_guard<std::mutex> il(g_injectMu); idle = g_injectQ.empty(); }
+                        {
+                            std::lock_guard<std::mutex> pl2(g_polishMu);
+                            if (idle && !g_delivering) break;
+                        }
+                        if (GetTickCount64() > pl) {
+                            Log(L"WARN", L"session end: closing period still queued at drain close");
+                            break;
+                        }
+                        Sleep(20);
+                    }
+                }
             }
             g_drainActive = false;
             Log(L"INFO", L"drain: tail released after user stop");
@@ -1919,7 +1948,6 @@ static void StartInjector()
 // target. One space between pieces is a delimiter, not formatting: nothing is added inside a
 // segment, nothing at the start of a session, and nothing if a piece already begins or the last
 // one ended with whitespace.
-static wchar_t g_lastInjected = 0;
 
 // When the session's punctuation comes from the punctuation model, the speech
 // model's own marks are removed here so exactly one writer punctuates: the model
@@ -1955,6 +1983,13 @@ static void QueueInject(const std::wstring& text, bool sep)
     std::wstring out = text;
     if (g_sessionPolish) StripAsrMarks(out);
     if (out.empty()) return;
+    if (!g_sessionPolish && !g_uttStarted) {
+        // Speech-mode contract, one sentence per session: because Tiro closes
+        // every session with a period (see the drain end), it also opens one.
+        // Capitalize the first letter the session types, whatever Nemotron sent.
+        for (wchar_t& ch : out)
+            if (iswalpha(ch)) { ch = (wchar_t)towupper(ch); break; }
+    }
     {
         std::lock_guard<std::mutex> lk(g_injectMu);
         bool needSpace = sep && g_lastInjected != 0 && !iswspace(g_lastInjected) && !iswspace(text[0]);
