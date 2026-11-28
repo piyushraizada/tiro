@@ -58,6 +58,9 @@ static const wchar_t* kRegKey     = L"Software\\Tiro";
 #define WM_APP_TEST_NOTIFY (WM_APP + 7)
 #define WM_APP_TEST_STARTUP (WM_APP + 14)   // --startup-toggle: run StartupToggle() directly
 #define WM_APP_TEST_RESTART (WM_APP + 15)   // --restart: exercise the restart handoff
+#define WM_APP_SUITE_STOP   (WM_APP + 18)   // app suite: stop dictation as a user would
+#define WM_APP_SUITE_CHECK  (WM_APP + 19)   // app suite: read the target back and judge it
+#define IDT_SUITE_CHECK     7              // app suite: judge 3 s after the stop (4 = IDT_EYE)
 
 enum State { kLoading = 0, kOff = 1, kOn = 2 };
 
@@ -546,6 +549,13 @@ static std::mutex g_polishMu;
 static std::condition_variable g_polishCv;
 static bool g_delivering = false;               // a Deliver is inside SendUnicode right now
 static std::atomic<bool> g_polishCancel{ false };
+// App-suite run state (debug only): set while --live is feeding a WAV at an application.
+static bool         g_suiteRun   = false;   // --live was started by the suite
+static bool         g_suiteStop  = false;   // stop dictation after feeding, like a user
+static std::wstring g_suiteExpect;          // what the recogniser should have said
+static std::wstring g_suiteResult;          // where to write the verdict line
+static std::wstring g_suiteMode;            // "basic" or "polish", for the result line
+static bool         g_suiteFocus = false;   // bring the target forward first
 // Which stage the last UIA rewrite reached, so a refusal names itself in the log instead of
 // being guessed at later. Values: element, patterns, selection, splice, settle.
 static const wchar_t* g_rewriteStage = L"none";
@@ -1738,6 +1748,10 @@ static void UnloadEngine()
 
 static void StartEngine()
 {
+    // Nothing may be reset while the engine is already running: the startup preload timer fires
+    // 1.2 s after launch and would otherwise wipe audio a session has already queued, which is
+    // exactly the first words the user spoke.
+    if (g_engine.active) return;
     {
         std::lock_guard<std::mutex> lk(g_engine.mu);
         g_engine.stop = false;
@@ -1746,7 +1760,6 @@ static void StartEngine()
         g_engine.q.clear();
     }
     g_drainActive = false;            // a new session never types the previous tail
-    if (g_engine.active) return;
     g_engine.active = true;
     RecorderOpen();
     g_engine.thread = CreateThread(nullptr, 0, EngineThread, nullptr, 0, nullptr);
@@ -1903,6 +1916,13 @@ static DWORD WINAPI FeederThread(LPVOID)
         }
         pos += n;
         Sleep(200);            // 200 ms of audio per 200 ms: real-time pacing
+    }
+    if (g_suiteStop) {
+        // The suite wants the stop path, because that is where polishing happens: let the last
+        // segment be injected, then stop the way the hotkey would.
+        Sleep(1500);
+        PostMessageW(g.hwnd, WM_APP_SUITE_STOP, 0, 0);
+        return 0;              // WM_APP_SUITE_CHECK closes the window once it has judged
     }
     Sleep(4000);               // let endpointing finalise and inject
     PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
@@ -2928,6 +2948,236 @@ static std::wstring UiaFocusedValue(HWND target)
     return out;
 }
 
+// ---- App suite: judge what actually landed in the target (debug only) --------
+static std::wstring NormText(const std::wstring& s)
+{
+    std::wstring o;
+    for (wchar_t c : s) {
+        if (iswalnum(c)) o.push_back((wchar_t)towlower(c));
+        else if (!o.empty() && o.back() != L' ') o.push_back(L' ');
+    }
+    while (!o.empty() && o.back() == L' ') o.pop_back();
+    return o;
+}
+
+static std::vector<std::wstring> Words(const std::wstring& s)
+{
+    std::vector<std::wstring> w; std::wstring cur;
+    for (wchar_t c : s) {
+        if (c == L' ') { if (!cur.empty()) { w.push_back(cur); cur.clear(); } }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) w.push_back(cur);
+    return w;
+}
+
+// Percentage of the expected words found in the actual text, in order. Speech recognition of a
+// synthetic voice is word-stable but not guaranteed byte-identical (punctuation, casing, a
+// homophone), so the suite judges words rather than characters.
+static int SuiteMatchPct(const std::wstring& expected, const std::wstring& actual)
+{
+    std::vector<std::wstring> e = Words(NormText(expected)), a = Words(NormText(actual));
+    if (e.empty()) return 0;
+    size_t j = 0, hit = 0;
+    for (size_t i = 0; i < e.size(); ++i)
+        for (size_t k = j; k < a.size(); ++k)
+            if (a[k] == e[i]) { ++hit; j = k + 1; break; }
+    return (int)(hit * 100 / e.size());
+}
+
+// Text of one UIA element, through the value pattern or the text model, whichever it offers.
+static std::wstring ReadElementText(IUIAutomationElement* el)
+{
+    std::wstring out;
+    if (!el) return out;
+    IUnknown* p = nullptr;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId, &p)) && p) {
+        IUIAutomationValuePattern* vp = nullptr;
+        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&vp)))) {
+            BSTR b = nullptr;
+            if (SUCCEEDED(vp->get_CurrentValue(&b)) && b) { out = b; SysFreeString(b); }
+            vp->Release();
+        }
+        p->Release();
+        p = nullptr;
+    }
+    if (out.empty() && SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId, &p)) && p) {
+        IUIAutomationTextPattern* tp = nullptr;
+        if (SUCCEEDED(p->QueryInterface(IID_PPV_ARGS(&tp)))) {
+            IUIAutomationTextRange* d = nullptr;
+            if (SUCCEEDED(tp->get_DocumentRange(&d)) && d) {
+                BSTR b = nullptr;
+                if (SUCCEEDED(d->GetText(-1, &b)) && b) { out = b; SysFreeString(b); }
+                d->Release();
+            }
+            tp->Release();
+        }
+        p->Release();
+    }
+    return out;
+}
+
+// Read the target back. Order matters: a text input (Edit) is tried before a document, because a
+// Chromium window reports the page itself as a Document whose text is the page, while the box the
+// user is dictating into is an Edit. Contenteditable surfaces arrive as Edit too. A document is
+// still read when there is no Edit at all (Word), and a classic control is the last resort.
+static std::wstring ReadTargetText(HWND target)
+{
+    IUIAutomation* uia = UiaSingleton();
+    if (uia) {
+        // 1. whatever holds focus, if it is an input
+        IUIAutomationElement* el = nullptr;
+        if (SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+            CONTROLTYPEID ct = 0;
+            el->get_CurrentControlType(&ct);
+            if (ct == UIA_EditControlTypeId) {
+                std::wstring t = ReadElementText(el);
+                el->Release();
+                if (!t.empty()) return t;
+            } else {
+                el->Release();
+            }
+        }
+        if (target) {
+            IUIAutomationElement* root = nullptr;
+            if (SUCCEEDED(uia->ElementFromHandle(target, &root)) && root) {
+                wchar_t winTitle[192]{};
+                GetWindowTextW(target, winTitle, 192);
+                const CONTROLTYPEID order[3] = { UIA_EditControlTypeId, UIA_ComboBoxControlTypeId,
+                                                  UIA_DocumentControlTypeId };
+                for (int pass = 0; pass < 3; ++pass) {
+                    VARIANT v; VariantInit(&v); v.vt = VT_I4; v.lVal = (LONG)order[pass];
+                    IUIAutomationCondition* cond = nullptr;
+                    if (FAILED(uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &cond)) || !cond)
+                        continue;
+                    IUIAutomationElementArray* arr = nullptr;
+                    if (SUCCEEDED(root->FindAll(TreeScope_Descendants, cond, &arr)) && arr) {
+                        int n = 0;
+                        arr->get_Length(&n);
+                        std::wstring pick;
+                        // Three sweeps, best first: the writable input that holds keyboard focus,
+                        // then any visible writable input, then anything with text at all. The
+                        // first sweep matters in a Chromium window, where the (read-only) address
+                        // element sits in the tree ahead of the box being dictated into.
+                        for (int mode = 0; mode < 3 && pick.empty(); ++mode) {
+                            for (int i = 0; i < n && i < 200; ++i) {
+                                IUIAutomationElement* kid = nullptr;
+                                if (FAILED(arr->GetElement(i, &kid)) || !kid) continue;
+                                bool ro = false, offs = false, focus = false;
+                                BOOL b = FALSE;
+                                if (SUCCEEDED(kid->get_CurrentIsOffscreen(&b))) offs = b != FALSE;
+                                b = FALSE;
+                                if (SUCCEEDED(kid->get_CurrentHasKeyboardFocus(&b))) focus = b != FALSE;
+                                IUnknown* pv = nullptr;
+                                if (SUCCEEDED(kid->GetCurrentPattern(UIA_ValuePatternId, &pv)) && pv) {
+                                    IUIAutomationValuePattern* vp = nullptr;
+                                    if (SUCCEEDED(pv->QueryInterface(IID_PPV_ARGS(&vp)))) {
+                                        BOOL r = FALSE;
+                                        if (SUCCEEDED(vp->get_CurrentIsReadOnly(&r))) ro = r != FALSE;
+                                        vp->Release();
+                                    }
+                                    pv->Release();
+                                }
+                                bool ok = (mode == 0) ? (focus && !ro)
+                                        : (mode == 1) ? (!ro && !offs)
+                                                      : true;
+                                if (!ok) { kid->Release(); continue; }
+                                std::wstring kt = ReadElementText(kid);
+                                kid->Release();
+                                // An Electron or Chromium frame exposes extra elements whose "text" is the
+                                // page URL or the window title. Dictation never looks like either,
+                                // so neither is the surface being judged.
+                                if (kt.find(L"://") != std::wstring::npos) continue;
+                                if (winTitle[0] && kt == winTitle) continue;
+                                if (!kt.empty()) { pick = kt; break; }
+                            }
+                        }
+                        arr->Release();
+                        if (!pick.empty()) { cond->Release(); root->Release(); return pick; }
+                    }
+                    if (cond) cond->Release();
+                }
+                root->Release();
+            }
+        }
+    }
+    HWND ed = FocusedEditOf(target);
+    if (ed) {
+        DWORD_PTR len = 0;
+        if (SendMessageTimeoutW(ed, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 300, &len) && len < 200000) {
+            std::vector<wchar_t> buf(len + 1, 0);
+            if (SendMessageTimeoutW(ed, WM_GETTEXT, len, (LPARAM)buf.data(), SMTO_ABORTIFHUNG, 300, nullptr))
+                return std::wstring(buf.data());
+        }
+    }
+    return std::wstring();
+}
+
+// Bring a window to the foreground from a background process. Windows refuses SetForegroundWindow
+// to a process that does not own the foreground and did not receive the last input, so attach to
+// the foreground thread for the duration of the call; that is the part the ALT nudge alone cannot
+// promise, and it is why switching between applications was unreliable.
+static bool ForceForeground(HWND target)
+{
+    if (!target || !IsWindow(target)) return false;
+    if (GetForegroundWindow() == target) return true;
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+    DWORD myThread = GetCurrentThreadId();
+    bool attached = fgThread && fgThread != myThread &&
+                    AttachThreadInput(myThread, fgThread, TRUE) != FALSE;
+    BringWindowToTop(target);
+    SetForegroundWindow(target);
+    if (attached) AttachThreadInput(myThread, fgThread, FALSE);
+    return GetForegroundWindow() == target;
+}
+
+static void SuiteWriteResult(const wchar_t* mode, const wchar_t* verdict, int pct, const std::wstring& text);
+static void SuiteCheck();
+
+static void SuiteWriteResult(const wchar_t* mode, const wchar_t* verdict, int pct, const std::wstring& text)
+{
+    if (g_suiteResult.empty()) return;
+    FILE* f = nullptr;
+    // One line per run: mode|verdict|match%|text. UTF-8 so a runner can parse it directly.
+    if (_wfopen_s(&f, g_suiteResult.c_str(), L"w, ccs=UTF-8") == 0 && f) {
+        fwprintf(f, L"%ls|%ls|%d|%ls\n", mode, verdict, pct, text.c_str());
+        fclose(f);
+    }
+}
+
+static void SuiteCheck()
+{
+    std::wstring read = ReadTargetText(GetForegroundWindow());
+    int pctRead = g_suiteExpect.empty() ? (read.empty() ? 0 : 100)
+                                        : SuiteMatchPct(g_suiteExpect, read);
+    bool readOk = !read.empty() && pctRead >= 80;
+    int pctSent = g_suiteExpect.empty() ? (g_sessionText.empty() ? 0 : 100)
+                                        : SuiteMatchPct(g_suiteExpect, g_sessionText);
+    bool sentOk = !g_sessionText.empty() && pctSent >= 80;
+    // PASS              the target reads back the sentence: dictation demonstrably works.
+    // PASS_DELIVERED    the keystrokes were delivered but this application's accessibility does
+    //                   not expose its text (Electron frames in particular). Recorded as a pass
+    //                   for the baseline, and named for what it is.
+    // FAIL / FAIL_...   nothing usable arrived.
+    const wchar_t* verdict;
+    bool pass;
+    if (readOk)       { verdict = L"PASS";           pass = true;  }
+    else if (sentOk)  { verdict = L"PASS_DELIVERED"; pass = true;  }
+    else if (!read.empty() || !g_sessionText.empty())
+                      { verdict = L"FAIL";           pass = false; }
+    else              { verdict = L"FAIL_DELIVERED"; pass = false; }
+    std::wstring line = std::wstring(L"suite: ") + verdict +
+                        L" | mode=" + g_suiteMode +
+                        L" | read=" + std::to_wstring(pctRead) + L"% sent=" + std::to_wstring(pctSent) + L"%" +
+                        L" | read=\"" + read + L"\" | sent=\"" + g_sessionText + L"\"";
+    Log(pass ? L"INFO" : L"ERROR", line);
+    SuiteWriteResult(g_suiteMode.c_str(), verdict, readOk ? pctRead : pctSent,
+                     readOk ? read : g_sessionText);
+    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+}
+
+
 // UIA calls into a misbehaving provider can block for seconds, so the query runs
 // on its own thread and TurnOn waits at most 700 ms. Unknown falls back to
 // "unsupported", which is the conservative answer: the speech model keeps
@@ -3045,15 +3295,18 @@ static DWORD WINAPI PolishThread(LPVOID p)
     else
         swprintf_s(b, L"polish: no one-shot rewrite (%ls refused, model %llu ms); text left as typed",
                    g_rewriteStage, (unsigned long long)dt);
-    Log(L"WARN", b);
+    Log(oneShot ? L"INFO" : L"WARN", b);
     // The rewrite was the closing writer for this mode and it just failed.
     // The text keeps every mark the speech model supplied - nothing is ever
     // stripped - but the model's final period is exactly what streaming
     // drops, so repay that one mark from own pocket: type it at the caret
     // (which the failed rewrite never moved). Re-open the drain window around
     // it, since the injector refuses text once dictation has fully closed.
-    // If the model did supply a trailing mark, this stays silent.
-    if (g_uttStarted) {
+    // If the model did supply a trailing mark, this stays silent. A rewrite that SUCCEEDED has
+    // already supplied the final mark (it is the closing writer in that mode), so this must
+    // never run alongside it - that typed a second full stop at the end of every polished
+    // sentence in a target that accepts the one-shot rewrite.
+    if (!oneShot && g_uttStarted) {
         wchar_t last = 0;
         { std::lock_guard<std::mutex> il(g_injectMu); last = g_lastInjected; }
         if (iswalnum(last)) {
@@ -3373,6 +3626,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_debug) PostQuitMessage(0);
         return 0;
 
+    case WM_APP_SUITE_STOP:
+        // Stop exactly as a user would, so the polish pass (if enabled) is exercised too.
+        if (g.state == kOn) StopDictation(L"app suite", true);
+        SetTimer(hwnd, IDT_SUITE_CHECK, 3000, nullptr);
+        return 0;
+    case WM_APP_SUITE_CHECK:
+        SuiteCheck();
+        return 0;
     case WM_APP_TEST_RESTART:
         RelaunchAndExit();
         return 0;
@@ -3453,6 +3714,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == IDT_WATCH) { WatchForeground(); return 0; }
         if (wp == IDT_EYE) {
             EyeballTick();
+            return 0;
+        }
+        if (wp == IDT_SUITE_CHECK) {
+            KillTimer(hwnd, IDT_SUITE_CHECK);
+            SuiteCheck();
             return 0;
         }
         if (wp == IDT_METER) {
@@ -3938,9 +4204,79 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                     for (HWND h = nullptr; (h = FindWindowExW(nullptr, h, nullptr, nullptr)) != nullptr; ) {
                         wchar_t t[128]{};
                         GetWindowTextW(h, t, 128);
-                        if (wcsstr(t, argv[j + 1]) && IsWindowVisible(h)) { g.target = h; break; }
+                        wchar_t c[128]{};
+                        GetClassNameW(h, c, 128);
+                        // Edge exposes a TabProxyWindow that carries the page title and would
+                        // otherwise win the match while never accepting a single keystroke.
+                        const bool shellSurface = wcsstr(c, L"TabProxyWindow") != nullptr ||
+                                                  !_wcsicmp(c, L"Progman") || !_wcsicmp(c, L"WorkerW") ||
+                                                  !_wcsicmp(c, L"Shell_TrayWnd") ||
+                                                  !_wcsicmp(c, L"Shell_SecondaryTrayWnd");
+                        if (wcsstr(t, argv[j + 1]) && IsWindowVisible(h) && !shellSurface) {
+                            g.target = h;
+                            break;
+                        }
                     }
-                    break;
+                }
+                else if (!_wcsicmp(argv[j], L"--expect") && j + 1 < argc) g_suiteExpect = argv[j + 1];
+                else if (!_wcsicmp(argv[j], L"--result") && j + 1 < argc) g_suiteResult = argv[j + 1];
+                else if (!_wcsicmp(argv[j], L"--mode")   && j + 1 < argc) g_suiteMode   = argv[j + 1];
+            }
+            for (int j = 1; j < argc; ++j) {
+                if (!_wcsicmp(argv[j], L"--stop"))  g_suiteStop  = true;
+                if (!_wcsicmp(argv[j], L"--focus")) g_suiteFocus = true;
+            }
+            g_suiteRun = g_suiteStop || !g_suiteExpect.empty();
+            if (g_suiteRun) {
+                // A suite run types into a named window or not at all: without --target the
+                // harness would type into whatever happens to hold focus.
+                bool haveTarget = false;
+                for (int j = 1; j < argc; ++j)
+                    if (!_wcsicmp(argv[j], L"--target")) haveTarget = true;
+                if (!haveTarget) {
+                    Log(L"ERROR", L"suite: refusing to run without --target; nothing was typed");
+                    SuiteWriteResult(g_suiteMode.c_str(), L"FAIL_NO_TARGET", 0, L"");
+                    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+                    if (argv) LocalFree(argv);
+                    return 0;
+                }
+            }
+            if (g_suiteFocus) {
+                // Bring the target forward. Windows refuses SetForegroundWindow from a background
+                // process, so nudge with ALT and retry; the delivery itself still needs the
+                // window to hold focus, which is the behaviour under test.
+                int tries = 0;
+                // A foreground change can land late when the window that holds it is a shell
+                // proxy: the request is granted but applied asynchronously, so keep asking for
+                // up to six seconds instead of concluding it was refused after one second.
+                for (; tries < 24 && !ForceForeground(g.target); ++tries) {
+                    // Second mechanism, then a pause: a window that is still painting drops the
+                    // request, and a process without foreground rights needs the ALT nudge.
+                    keybd_event(VK_MENU, 0, 0, 0);
+                    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+                    SwitchToThisWindow(g.target, TRUE);
+                    SetForegroundWindow(g.target);
+                    Sleep(250);
+                }
+                {
+                    // Class only: a window title is the user's document name and never goes in the
+                    // log, not even on the suite path.
+                    wchar_t db[128];
+                    wchar_t clsNow[64]{};
+                    GetClassNameW(GetForegroundWindow(), clsNow, 64);
+                    swprintf_s(db, L"suite: foreground after %d attempts, class=%ls, on target=%d",
+                               tries, clsNow, GetForegroundWindow() == g.target ? 1 : 0);
+                    Log(L"INFO", db);
+                }
+                bool fgOk = GetForegroundWindow() == g.target;
+                Log(fgOk ? L"INFO" : L"ERROR",
+                    fgOk ? L"suite: target holds the foreground"
+                         : L"suite: FAIL could not bring the target forward; nothing was typed");
+                if (!fgOk) {
+                    SuiteWriteResult(g_suiteMode.c_str(), L"FAIL_NOFOCUS", 0, L"");
+                    PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+                    if (argv) LocalFree(argv);
+                    return 0;
                 }
             }
             {
@@ -3949,6 +4285,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                 GetWindowTextW(g.target, title, 128);
                 Log(L"INFO", std::wstring(L"live test: target pinned (") + title + L", " +
                     cls + L"), feeding audio");
+            }
+            if (g_suiteRun) {
+                // No microphone here, so TurnOn never runs - but the session must still begin the
+                // way TurnOn begins it: a fresh sentence, and the punctuation-capability probe
+                // that the stop path waits on. Without this the suite exercises no polish at all.
+                g_uttStarted = false;
+                g_prevSessionTarget = g.target;
+                g_probePending = true;
+                ModeProbeCtx* ctx = new ModeProbeCtx{ g.target, ++g_sessionGen };
+                HANDLE probeTh = CreateThread(nullptr, 0, ModeProbeThread, ctx, 0, nullptr);
+                if (probeTh) CloseHandle(probeTh);
+                else {
+                    delete ctx;
+                    g_probePending = false;
+                    g_sessionPolish = g_polishEnabled && TargetSupportsOneShot(g.target);
+                }
             }
             CreateThread(nullptr, 0, FeederThread, nullptr, 0, nullptr);
             if (argv) LocalFree(argv);

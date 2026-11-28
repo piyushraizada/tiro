@@ -36,3 +36,5 @@ src/gitver.h
 __pycache__/
 *.pyc
 
+# app-suite run reports are output, not source
+test/results/

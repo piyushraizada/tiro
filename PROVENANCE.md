@@ -73,6 +73,9 @@ Model source: <https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b>
 |---|---|---|
 | `models/punctuation` (optional punctuation pass, off by default) | Apache-2.0 | <https://huggingface.co/Horizon-Labs/punctuation-restoration-base>. The user downloads it; Tiro does not bundle or fetch it. If it is ever bundled into a release, that project's licence text must ship inside its model folder, exactly as the Nemotron folder does. |
 
+| `tests/uia-target.html`, `tests/run-rewrite-tests.bat` | Original to this project. A marker-titled page and a three-test runner for the one-shot rewrite. | Original work; no third-party content. |
+| `tests/make-voice.ps1`, `tests/run-app-suite.ps1`, `test/fixtures/voice_suite.wav` | Original to this project. The synthetic-voice fixture (generated with the Windows speech synthesiser, so it carries no recorded voice or third-party audio) and the cross-application runner that feeds it. | Fixture is machine-generated speech from the local Windows voice; the runner is original work. |
+
 ## 7. Re-running this audit
 
 ```bash

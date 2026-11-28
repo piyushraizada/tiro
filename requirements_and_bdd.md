@@ -755,6 +755,12 @@ Scenario: The click that ended dictation does not restart it
   Given dictation stopped because the target lost focus
   When that same click reaches the tray icon within 500 ms
   Then the log records "toggle ignored: it is the click that just ended dictation"
+
+Scenario: The startup preload never discards audio a session already queued
+  Given the engine is running and a session has audio waiting to be decoded
+  When the preload timer asks for the engine to start 1.2 s after launch
+  Then the request changes nothing
+  And the queued audio is decoded, so the sentence's first words are transcribed
 ```
 
 ### Feature: Stop and drain
@@ -1092,6 +1098,13 @@ Scenario: A speech-mode session ends as a sentence
   When the user dictates another sentence in the same document and stops
   Then the seam carries one space and no duplicated period
   And a forced stop adds neither period nor space
+
+Scenario: A successful rewrite is the closing writer
+  Given punctuation is enabled and the target accepts the one-shot rewrite
+  When the user stops dictating with the hotkey
+  Then the rewrite supplies the final punctuation
+  And no closing period is typed on top of it
+  And the log records "polish: <a> chars -> <b> chars via uia-value" with no fallback line
 ```
 
 ### Feature: Capability boundaries
@@ -1144,6 +1157,57 @@ Scenario: Inference falls behind
   And dictation stays On instead of dropping out
 ```
 
+### Feature: Cross-application regression suite
+*FR-4, FR-9, FR-11, §6.7*
+
+The five applications the owner uses daily, run as one automated pass. Nothing here needs a
+human to type: a synthetic voice supplies the audio, the harness brings each window forward,
+and the suite reads the result back. `tests\run-app-suite.ps1` is the runner;
+`tests\make-voice.ps1` generates the fixture.
+
+```gherkin
+Scenario: Baseline dictation in every daily application
+  Given MS Word, Teams, Outlook on the web in Edge, Notepad++ and VS Code are open
+  And the caret is inside a text area in each one
+  When the suite runs the basic pass with polish off
+  Then each application receives the spoken sentence as typed, with no polish
+  And each application is recorded PASS or FAIL on its own
+  And the suite exits non-zero if any basic run did not pass
+
+Scenario: The polish pass is an inventory, never a gate
+  Given the same applications are open
+  When the suite runs the polish pass
+  Then a target that accepts the one-shot rewrite is recorded PASS
+  And a target that refuses it is recorded FAIL, with the text left exactly as typed
+  And the suite still exits 0
+
+Scenario: A window that will not come forward is never typed into
+  Given the target window does not hold the foreground
+  When the suite cannot bring it forward
+  Then nothing is typed
+  And the run is recorded FAIL_NOFOCUS
+  And the log records "suite: FAIL could not bring the target forward; nothing was typed"
+
+Scenario: The judged text is what the application shows
+  Given the run has stopped dictation and the rewrite has had its time
+  When the suite reads the target back
+  Then it compares words, not bytes, against the spoken sentence
+  And an application whose text accessibility cannot see is recorded PASS_DELIVERED
+  And the log line carries the transcript it judged
+
+Scenario: A run without a named target is refused
+  Given the suite starts without --target
+  When the harness would otherwise type into whatever holds focus
+  Then it types nothing
+  And the run is recorded FAIL_NO_TARGET
+
+Scenario: A synthetic voice drives the run
+  Given tests\make-voice.ps1 wrote the 16 kHz mono fixture
+  When the suite runs
+  Then the audio is fed through the same queue the microphone fills
+  And endpointing, injection and the stop path are exercised exactly as live
+```
+
 ---
 
 ## 8. Verification map
@@ -1161,6 +1225,8 @@ Scenario: Inference falls behind
 | FR-9 robustness | self-test; drain log lines; shed warnings |
 | FR-10 logging | `app.log` with `LogText` 0 and 1 |
 | FR-11 diagnostics | the switch table; `--selftest` transcript |
+| Cross-application baseline | `tests\run-app-suite.ps1` basic pass, per application |
+| Polish inventory | `tests\run-app-suite.ps1` polish pass, recorded per application |
 
 **Release gate:** clean build; the About/stamp hash equals
 `git rev-parse --short HEAD`; `--debug --selftest` on the fixture produces the

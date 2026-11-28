@@ -13,6 +13,13 @@
   with impossible lengths are refused cleanly, and if a recording device stops
   answering, that session is abandoned instead of touching memory it may still
   be using.
+* **The first words after a quick start are no longer at risk.** A start-up
+  housekeeping step could discard speech that was already waiting to be
+  transcribed; it now leaves a running session alone, so a sentence begun the
+  instant Tiro starts arrives whole.
+* **No more double full stop.** When the polished sentence was already
+  punctuated, the closing period could be added a second time; the polished
+  sentence is now the only one writing its final mark.
 * **Hardened against tampered files.** The text engine is loaded only from the
   Windows system folder, model files are checked against pinned hashes when a
   release is built, and the binary is compiled with control-flow and address

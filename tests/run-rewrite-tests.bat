@@ -25,7 +25,9 @@ for %%P in (
 if not defined CHROME ( echo SETUP: Chrome not found & exit /b 2 )
 
 set "FAILED=0"
+set "KILLCMD=powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" ^| Where-Object { $_.CommandLine -like '*tiro-uia-test-profile*' } ^| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }""
 set "PROFILE=%TEMP%\tiro-uia-test-profile"
+if exist "%PROFILE%" rmdir /s /q "%PROFILE%"
 set "PAGE=file:///%~dp0uia-target.html"
 
 echo.
@@ -42,6 +44,7 @@ rem The page focuses its own control; give the cold profile time to paint.
 ping -n 6 127.0.0.1 >nul
 "%EXE%" --debug --uia-rewrite
 if errorlevel 1 ( echo TEST 2: FAIL & set "FAILED=1" ) else ( echo TEST 2: PASS )
+call %KILLCMD%
 
 echo.
 echo === 3/3  Chromium contenteditable (must stay exactly as typed) ============
@@ -53,6 +56,7 @@ set "TIRO_UIA_EXPECT=raw"
 "%EXE%" --debug --uia-rewrite
 set "TIRO_UIA_EXPECT="
 if errorlevel 1 ( echo TEST 3: FAIL & set "FAILED=1" ) else ( echo TEST 3: PASS )
+call %KILLCMD%
 
 echo.
 if "%FAILED%"=="1" ( echo RESULT: FAILED & exit /b 1 )

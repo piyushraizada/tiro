@@ -52,13 +52,20 @@ writes the dictated words to the log.
 
 The diagnostic switches (`--about`, `--hotkey`, `--notify`, `--startup-toggle`,
 `--restart`, `--selftest <wav>`, `--live <wav>`, `--polish-file`,
-`--polish-tokens`, `--rewrite-demo`, `--uia-rewrite`, `--probe-focus`) are
+`--polish-tokens`, `--rewrite-demo`, `--uia-rewrite`, `--probe-focus`,
+`--stop`, `--focus`, `--expect <text>`, `--result <file>`, `--mode <name>`) are
 **inert unless `--debug` is also on the command line**, and they grant no
 privilege: they read and write only the file paths they are given. Two of them
 type: `--rewrite-demo` types into a window it creates itself, and
 `--uia-rewrite` types only into a window whose title contains
 `TIRO-UIA-TARGET`, after verifying that the process owns the foreground — a
 normal launch of `Tiro.exe` never sets `--debug` and has neither switch.
+
+`--live` with any of `--stop`, `--focus`, `--expect` or `--result` is the
+cross-application suite, and it types into a real application window: it
+**refuses to run without `--target`**, brings that window forward only after
+asking Windows, types nothing if the window does not take the foreground, and
+writes a single-line verdict to the `--result` path. It still needs `--debug`.
 
 ## Build hardening
 
