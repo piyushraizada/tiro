@@ -1,5 +1,5 @@
 ﻿// Tiro - Windows dictation app. Layer 1: tray shell, state machine, menu, dialogs.
-// Spec: requirements_and_bdd.md (version 1.1.0).
+// Spec: requirements_and_bdd.md (version 1.1.1).
 
 #include <windows.h>
 #include <shellapi.h>
@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cwctype>
 #include <string>
 #include <vector>
@@ -39,7 +40,7 @@
 #pragma comment(lib, "uiautomationcore.lib")
 
 static const wchar_t* kAppName    = L"Tiro";
-static const wchar_t* kAppVersion = L"1.1.0";
+static const wchar_t* kAppVersion = L"1.1.1";
 // A build's true identity is the commit it was compiled from. build_release.bat stamps it
 // into src/gitver.h (generated, ignored) before every build; dirty trees get a -dirty tail.
 // Rebuilding from the same commit always yields the same string - which a build counter never could.
@@ -509,8 +510,10 @@ struct Audio {
     HANDLE evt = nullptr;
     HANDLE thread = nullptr;
     volatile LONG stop = 0;
-    double peak = 0.0;
-    double rms = 0.0;
+    // Written by the capture thread, read by the UI timer that animates the eyeball. Atomic so
+    // the two never argue about a torn double.
+    std::atomic<double> peak{ 0.0 };
+    std::atomic<double> rms{ 0.0 };
     ULONGLONG frames = 0;
 };
 static Audio g_audio;
@@ -521,7 +524,8 @@ static void StartEngine();
 static void StopEngine();
 static bool EngineActive();   // engine thread alive? (g_engine is defined further down)
 static void EnginePushSamples(const short* samples, UINT32 count);
-static void MarkSessionBoundary();    // dictation-on: boundary without a reset
+static void MarkSessionBoundary();    // dictation-on: boundary without a reset (engine thread only)
+static void RequestSessionBoundary(); // UI-side: ask the engine thread to mark it, bounded wait
 static void DropPendingAudio();
 static HWND PickTarget();
 static void QueueInject(const std::wstring& text, bool sep = true);
@@ -542,10 +546,17 @@ static std::mutex g_polishMu;
 static std::condition_variable g_polishCv;
 static bool g_delivering = false;               // a Deliver is inside SendUnicode right now
 static std::atomic<bool> g_polishCancel{ false };
+// Which stage the last UIA rewrite reached, so a refusal names itself in the log instead of
+// being guessed at later. Values: element, patterns, selection, splice, settle.
+static const wchar_t* g_rewriteStage = L"none";
+static HRESULT g_rewriteHr = S_OK;
 static bool g_polishEnabled = false;
 static std::atomic<bool> g_sessionPolish{ false };   // this session relies on the punctuation model
 static std::atomic<bool> g_probePending{ false };    // capability probe running in the background
-static bool g_uttStarted = false;      // anything typed since the session started
+// Written by the engine thread when it queues a delta and cleared by the UI at turn-on and at
+// stop, so it must be atomic: a torn read here used to be able to suppress the separating space
+// between two utterances.
+static std::atomic<bool> g_uttStarted{ false };   // anything typed since the session started
                                        // (reset at every TurnOn, not just engine start)
 static wchar_t g_lastInjected = 0;     // last char queued for injection (see QueueInject)
 static wchar_t g_docTail = 0;          // last char typed, surviving queue clears
@@ -554,6 +565,15 @@ static bool TargetSupportsOneShot(HWND top);   // defined with the rewrite paths
 struct ModeProbeCtx { HWND target; unsigned long long gen; };
 static DWORD WINAPI ModeProbeThread(LPVOID p); // decides it away from the microphone
 static std::atomic<unsigned long long> g_sessionGen{ 0 };  // probe results belong to one session
+
+// ---- Injection queue ---------------------------------------------------------
+// The engine and polish threads produce, the injector thread consumes, the UI clears it at
+// turn-on and at stop. Declared here because TurnOn touches g_lastInjected under the lock.
+static std::deque<std::wstring> g_injectQ;
+static std::mutex g_injectMu;
+static std::condition_variable g_injectCv;
+static bool g_injectStop = false;
+static HANDLE g_injectThread = nullptr;
 
 static const wchar_t* OpenErrorMessage(HRESULT hr)
 {
@@ -669,9 +689,22 @@ static void CloseCapture()
 {
     if (g_audio.thread) {
         InterlockedExchange(&g_audio.stop, 1);
-        WaitForSingleObject(g_audio.thread, 2000);
+        DWORD wr = WaitForSingleObject(g_audio.thread, 2000);
         CloseHandle(g_audio.thread);
         g_audio.thread = nullptr;
+        if (wr != WAIT_OBJECT_0) {
+            // The capture thread did not stop in 2 s - a wedged driver inside GetBuffer. It may
+            // still be reading these COM objects, so release nothing: leak one session's audio
+            // objects rather than free memory a live thread is using. The next turn-on creates
+            // a fresh set, and the process exits normally at logout.
+            Log(L"ERROR", L"capture: thread did not stop in 2 s; audio objects leaked for this session");
+            g_audio.cap = nullptr;
+            g_audio.client = nullptr;
+            g_audio.dev = nullptr;
+            g_audio.enumr = nullptr;
+            g_audio.evt = nullptr;      // it may still be waiting on this handle
+            return;
+        }
     }
     if (g_audio.client) g_audio.client->Stop();
     if (g_audio.cap)    { g_audio.cap->Release();    g_audio.cap = nullptr; }
@@ -680,6 +713,8 @@ static void CloseCapture()
     if (g_audio.enumr)  { g_audio.enumr->Release();  g_audio.enumr = nullptr; }
     if (g_audio.evt)    { CloseHandle(g_audio.evt);  g_audio.evt = nullptr; }
 }
+
+static std::wstring FgProcessName(HWND h);   // defined below; used by the turn-on log
 
 static void TurnOn()
 {
@@ -710,20 +745,22 @@ static void TurnOn()
         Notify(OpenErrorMessage(hr));
         return;
     }
-    MarkSessionBoundary();  // boundary, not a reset: the stream stays warm
+    // The recogniser stream belongs to the engine thread: asking it to mark the seam is the only
+    // way to touch that stream without racing a decode.
+    RequestSessionBoundary();
     DropPendingAudio();
     ClearInjectQueue();
     { std::lock_guard<std::mutex> lk(g_polishMu); g_sessionText.clear(); }
     g_polishCancel = true;          // if a polish replacement is still typing, stop it now
     g.target = PickTarget();
     {
-        wchar_t cls[64]{}; wchar_t title[128]{};
-        if (g.target) {
-            GetClassNameW(g.target, cls, 64);
-            GetWindowTextW(g.target, title, 128);
-        }
-        Log(L"INFO", std::wstring(L"target window: ") + (g.target ? cls : L"none") + L" \"" +
-                     (g.target ? title : L"") + L"\"");
+        wchar_t cls[64]{};
+        if (g.target) GetClassNameW(g.target, cls, 64);
+        // Class and process only, never the window title: the title is where document
+        // names and URLs live, and this line is written to app.log on every turn-on.
+        // The transient popup may quote a title; the persisted log does not.
+        Log(L"INFO", std::wstring(L"target window: ") + (g.target ? cls : L"none") +
+                     (g.target ? (L" (" + FgProcessName(g.target) + L")") : L""));
     }
     if (!g.target) {
         CloseCapture();     // never leave the microphone live with nothing to type into
@@ -753,7 +790,10 @@ static void TurnOn()
     // With the decoder retired per session, the model no longer trails a space
     // across the seam, so when resuming in the SAME window the remembered last
     // typed character stands in for it; a different window starts fresh.
-    if (g_docTail && g.target == g_prevSessionTarget) g_lastInjected = g_docTail;
+    if (g_docTail && g.target == g_prevSessionTarget) {
+        std::lock_guard<std::mutex> il(g_injectMu);   // the injector owns this field
+        g_lastInjected = g_docTail;
+    }
     g_prevSessionTarget = g.target;
     g_uttStarted = false;
     // The capability probe must never delay the microphone: accessibility into an
@@ -1059,9 +1099,26 @@ struct Engine {
     bool drain = false;
     bool drainPolish = false;
     ULONGLONG drainUntil = 0;
+    // A session boundary is requested by the UI thread (which must not touch the recogniser
+    // stream) and made by the engine thread, which answers with boundaryAck.
+    bool boundaryReq = false;
+    bool boundaryAck = false;
 };
 static Engine g_engine;
 static bool EngineActive() { return g_engine.active; }
+
+// UI thread. The engine wakes at least every 50 ms, so this normally costs one wake-up; the wait
+// is bounded in case it is busy with a backlog, and a missed mark only misplaces a log-segment
+// boundary - it never changes what gets typed, because delivery is driven by g_typed, not by it.
+static void RequestSessionBoundary()
+{
+    std::unique_lock<std::mutex> lk(g_engine.mu);
+    g_engine.boundaryReq = true;
+    g_engine.boundaryAck = false;
+    g_engine.cv.notify_all();
+    g_engine.cv.wait_for(lk, std::chrono::milliseconds(500),
+                         [] { return g_engine.boundaryAck || !g_engine.active; });
+}
 
 // True from the moment a user stop begins until the drained tail has been typed. The injector
 // accepts work while this is set even though the state is already Off - that is the whole
@@ -1288,6 +1345,10 @@ static std::string g_typed;          // handed to the injector for this utteranc
 // after the first decoded into nothing. Instead, mark where the running text currently ends:
 // whatever the previous session left behind is history, and this session only ever types text
 // that appears after the mark.
+//
+// ENGINE THREAD ONLY. The sherpa stream is not thread-safe and g_typed has no other guard, so
+// calling this from the UI thread (as it once was) races a decode in progress. The UI asks for
+// the mark instead and waits, bounded, for the engine to make it - see TurnOn.
 static void MarkSessionBoundary()
 {
     if (!g_engine.rec || !g_engine.stream) { g_engine.cutTyped = 0; return; }
@@ -1430,9 +1491,6 @@ static void DestroyRecognizer()
 }
 
 static DWORD WINAPI EngineThread(LPVOID);
-// Declared before EngineThread: the drain-completion wait inspects the inject queue.
-static std::deque<std::wstring> g_injectQ;
-static std::mutex g_injectMu;
 
 static DWORD WINAPI EngineThread(LPVOID)
 {
@@ -1463,6 +1521,14 @@ static DWORD WINAPI EngineThread(LPVOID)
             g_engine.cv.wait_for(lk, std::chrono::milliseconds(50),
                                  [] { return g_engine.stop || !g_engine.q.empty(); });
             if (g_engine.stop) break;
+            // The UI cannot touch the recogniser stream, so a session boundary arrives as a
+            // request; make the mark here, on the thread that owns the stream, and answer.
+            if (g_engine.boundaryReq) {
+                g_engine.boundaryReq = false;
+                MarkSessionBoundary();
+                g_engine.boundaryAck = true;
+                g_engine.cv.notify_all();
+            }
             if (g_engine.drain && g_engine.q.empty()) {
                 // User stopped; everything captured so far is now decoded. Release the
                 // middleware after the drained words so the punctuation lands in order.
@@ -1486,6 +1552,13 @@ static DWORD WINAPI EngineThread(LPVOID)
                 DeliverStreamDelta();
                 SherpaOnnxDestroyOnlineStream(g_engine.stream);
                 g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
+                if (!g_engine.stream) {
+                    // Without a stream every later call would hand the C API a null pointer.
+                    // Stop the engine loudly instead; the next turn-on restarts it.
+                    Log(L"ERROR", L"engine: stream re-creation failed after the drain; engine stopped");
+                    PostMessageW(g.hwnd, WM_APP_ENGINE_FAIL, 0, 0);
+                    return 0;
+                }
                 g_typed.clear();
                 g_engine.cutTyped = 0;
                 g_engine.drain = false;
@@ -1505,6 +1578,11 @@ static DWORD WINAPI EngineThread(LPVOID)
                 if (g_engine.stream) {
                     SherpaOnnxDestroyOnlineStream(g_engine.stream);
                     g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
+                    if (!g_engine.stream) {
+                        Log(L"ERROR", L"engine: stream re-creation failed after the drain deadline; engine stopped");
+                        PostMessageW(g.hwnd, WM_APP_ENGINE_FAIL, 0, 0);
+                        return 0;
+                    }
                     g_typed.clear();
                     g_engine.cutTyped = 0;
                 }
@@ -1840,9 +1918,6 @@ static DWORD WINAPI FeederThread(LPVOID)
 // thread absorbs that, and the queue is bounded so a stalled target cannot grow memory.
 
 // g_injectQ / g_injectMu are declared above, before EngineThread.
-static std::condition_variable g_injectCv;
-static bool g_injectStop = false;
-static HANDLE g_injectThread = nullptr;
 
 
 static bool ProcessImageIs(HWND h, const wchar_t* name)
@@ -2579,19 +2654,69 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
     IUIAutomationTextRange* pre = nullptr;
     IUIAutomationTextRange* post = nullptr;
     BSTR bstr = nullptr;
-    do {
-        if (FAILED(uia->GetFocusedElement(&el)) || !el) break;
-        UIA_HWND hh = 0;
-        if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
-            HWND eh = (HWND)(INT_PTR)hh;
-            if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) break;
+    // Handshake retry. A fast punctuation model can start the rewrite before the target's
+    // accessibility provider has caught up with the last keystroke - Chrome exposes no
+    // ValuePattern at all for ~60-100 ms after a control takes focus, which used to abort the
+    // rewrite in 0 ms and leave the sentence unpolished. 400 ms is invisible to the user
+    // (polish is asynchronous) and turns a hard failure into a retry. A definitive answer
+    // (read-only, conflicting selection, provider mismatch) is never retried.
+    const ULONGLONG deadline = GetTickCount64() + 400;
+    bool ready = false;
+    bool definitive = false;      // retrying cannot change the answer
+    for (;;) {
+        g_rewriteStage = L"element";
+        HRESULT fhr = uia->GetFocusedElement(&el);
+        if (FAILED(fhr) || !el) { el = nullptr; g_rewriteStage = L"element-focus"; g_rewriteHr = fhr; }
+        else {
+            UIA_HWND hh = 0;
+            bool windowOk = true;
+            if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
+                HWND eh = (HWND)(INT_PTR)hh;
+                if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) {
+                    g_rewriteStage = L"element-window";
+                    windowOk = false;
+                }
+            }
+            if (windowOk) {
+                g_rewriteStage = L"patterns";
+                if (FAILED(el->GetCurrentPattern(UIA_ValuePatternId, &pVal)) || !pVal) {
+                    g_rewriteStage = L"no-value";
+                }
+                else if (FAILED(pVal->QueryInterface(IID_PPV_ARGS(&vp)))) {
+                    g_rewriteStage = L"no-value-qi";
+                }
+                else {
+                    BOOL ro = TRUE;
+                    if (FAILED(vp->get_CurrentIsReadOnly(&ro)) || ro) {
+                        g_rewriteStage = L"read-only";
+                        definitive = true;
+                    }
+                    else if (FAILED(el->GetCurrentPattern(UIA_TextPatternId, &pTxt)) || !pTxt) {
+                        g_rewriteStage = L"no-text";   // a settable value with no text surface
+                    }
+                    else if (FAILED(pTxt->QueryInterface(IID_PPV_ARGS(&tp)))) {
+                        g_rewriteStage = L"no-text-qi";
+                    }
+                    else {
+                        ready = true;
+                    }
+                }
+            }
         }
-        if (FAILED(el->GetCurrentPattern(UIA_ValuePatternId, &pVal)) || !pVal) break;
-        if (FAILED(pVal->QueryInterface(IID_PPV_ARGS(&vp)))) break;
-        BOOL ro = TRUE;
-        if (FAILED(vp->get_CurrentIsReadOnly(&ro)) || ro) break;
-        if (FAILED(el->GetCurrentPattern(UIA_TextPatternId, &pTxt)) || !pTxt) break;
-        if (FAILED(pTxt->QueryInterface(IID_PPV_ARGS(&tp)))) break;
+        if (ready) break;
+        if (definitive) break;
+        if (GetTickCount64() >= deadline) break;
+        if (vp) { vp->Release(); vp = nullptr; }
+        if (tp) { tp->Release(); tp = nullptr; }
+        if (pVal) { pVal->Release(); pVal = nullptr; }
+        if (pTxt) { pTxt->Release(); pTxt = nullptr; }
+        if (el) { el->Release(); el = nullptr; }
+        Sleep(60);
+    }
+    do {
+        if (!ready) break;
+
+        g_rewriteStage = L"selection";
 
         // Locate the dictated span: UIA selection must equal the raw text.
         if (FAILED(tp->GetSelection(&arr)) || !arr) break;
@@ -2620,6 +2745,8 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
             if (selText != raw) break;   // user moved on; leave it alone
         }
 
+        g_rewriteStage = L"splice";
+
         // Splice: value must be exactly [before][raw][after].
         if (FAILED(tp->get_DocumentRange(&doc)) || !doc) break;
         IUIAutomationTextRange* preR = nullptr; IUIAutomationTextRange* postR = nullptr;
@@ -2637,31 +2764,41 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
         std::wstring cur = bstr ? bstr : L""; SysFreeString(bstr); bstr = nullptr;
         if (cur != before + raw + after) break;   // provider disagrees with the text model; abort
 
+        g_rewriteStage = L"write";
+
         std::wstring nv = before + polished + after;
         BSTR nvB = SysAllocString(nv.c_str());
         HRESULT setHr = nvB ? vp->SetValue(nvB) : E_OUTOFMEMORY;
         if (nvB) SysFreeString(nvB);
         if (FAILED(setHr)) break;
+        g_rewriteStage = L"settle";
 
         // Whole-value writes leave the caret wherever the provider likes, and the
-        // accessibility tree refreshes asynchronously. Poll the fresh document
-        // range until it reports the new value, then walk back over the untouched
-        // tail and select the zero-length range: caret lands right after the
-        // polished span so dictation can continue from there.
-        // The write itself is not the proof: some providers (Antigravity's chat
-        // box) accept SetValue and never apply it. Success means the text model
-        // reported the new value; anything else is a refusal, reported as one.
+        // accessibility tree refreshes asynchronously. Poll the value until it reports
+        // the new text, then walk a fresh document range back over the untouched tail
+        // and select the zero-length range: the caret lands right after the polished
+        // span so dictation can continue from there.
+        // The write itself is not the proof: some providers (Antigravity's chat box)
+        // accept SetValue and never apply it. Ask the ValuePattern what the value is now -
+        // one property read per poll. Reading the text model instead rebuilds the whole
+        // document on every poll, which on a long document costs the full second and then
+        // reports a refusal for a write that did land.
         bool settled = false;
         ULONGLONG caretT0 = GetTickCount64();
-        for (int attempt = 0; GetTickCount64() - caretT0 < 1000; ++attempt) {
+        while (GetTickCount64() - caretT0 < 1000) {
+            BSTR cv = nullptr;
+            std::wstring now;
+            if (FAILED(vp->get_CurrentValue(&cv))) break;
+            if (cv) now = cv;
+            if (cv) SysFreeString(cv);
+            if (now == nv) { settled = true; break; }
+            Sleep(40);
+        }
+        if (settled) {
+            // Caret placement, once: a fresh document range, walked back over the
+            // untouched tail, so dictation can continue from the end of the new text.
             IUIAutomationTextRange* doc2 = nullptr;
-            if (FAILED(tp->get_DocumentRange(&doc2)) || !doc2) break;
-            BSTR dv = nullptr;
-            std::wstring docTxt;
-            if (SUCCEEDED(doc2->GetText(-1, &dv))) docTxt = dv ? dv : L"";
-            if (dv) SysFreeString(dv);
-            settled = (docTxt == nv);
-            if (settled) {
+            if (SUCCEEDED(tp->get_DocumentRange(&doc2)) && doc2) {
                 IUIAutomationTextRange* caret = nullptr;
                 if (SUCCEEDED(doc2->Clone(&caret)) && caret) {
                     caret->MoveEndpointByRange(TextPatternRangeEndpoint_Start, doc2,
@@ -2675,12 +2812,10 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
                     caret->Release();
                 }
                 doc2->Release();
-                break;
             }
-            doc2->Release();
-            Sleep(40);
+        } else {
+            Log(L"WARN", L"polish: uia-value write was accepted but never appeared; treating as refusal");
         }
-        if (!settled) Log(L"WARN", L"polish: uia-value write was accepted but never appeared; treating as refusal");
         ok = settled;
     } while (false);
     if (bstr) SysFreeString(bstr);
@@ -2747,6 +2882,50 @@ static bool FocusedUiaValueWritable(HWND target)
     if (pVal) pVal->Release();
     if (el) el->Release();
     return ok;
+}
+
+// Current ValuePattern text of the focused element, when it belongs to `target`. Empty on any
+// failure - used by the automated harness to read back what the rewrite actually left behind.
+static std::wstring UiaFocusedValue(HWND target)
+{
+    std::wstring out;
+    IUIAutomation* uia = UiaSingleton();
+    if (!uia) return out;
+    IUIAutomationElement* el = nullptr;
+    IUnknown* pVal = nullptr;
+    IUIAutomationValuePattern* vp = nullptr;
+    do {
+        if (FAILED(uia->GetFocusedElement(&el)) || !el) break;
+        UIA_HWND hh = 0;
+        if (SUCCEEDED(el->get_CurrentNativeWindowHandle(&hh)) && hh) {
+            HWND eh = (HWND)(INT_PTR)hh;
+            if (eh != target && !IsChild(target, eh) && !IsChild(eh, target)) break;
+        }
+        if (FAILED(el->GetCurrentPattern(UIA_ValuePatternId, &pVal)) || !pVal) {
+            // A contenteditable exposes no ValuePattern at all; its text is only reachable
+            // through the text model, which is also why the rewrite cannot apply there.
+            IUnknown* pTxt2 = nullptr;
+            IUIAutomationTextPattern* tp2 = nullptr;
+            if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId, &pTxt2)) && pTxt2 &&
+                SUCCEEDED(pTxt2->QueryInterface(IID_PPV_ARGS(&tp2)))) {
+                IUIAutomationTextRange* doc2 = nullptr;
+                BSTR s2 = nullptr;
+                if (SUCCEEDED(tp2->get_DocumentRange(&doc2)) && doc2 &&
+                    SUCCEEDED(doc2->GetText(-1, &s2)) && s2) { out = s2; SysFreeString(s2); }
+                if (doc2) doc2->Release();
+            }
+            if (tp2) tp2->Release();
+            if (pTxt2) pTxt2->Release();
+            break;
+        }
+        if (FAILED(pVal->QueryInterface(IID_PPV_ARGS(&vp)))) break;
+        BSTR s = nullptr;
+        if (SUCCEEDED(vp->get_CurrentValue(&s)) && s) { out = s; SysFreeString(s); }
+    } while (false);
+    if (vp) vp->Release();
+    if (pVal) pVal->Release();
+    if (el) el->Release();
+    return out;
 }
 
 // UIA calls into a misbehaving provider can block for seconds, so the query runs
@@ -2864,8 +3043,8 @@ static DWORD WINAPI PolishThread(LPVOID p)
                    job->text.size(), out.size(), via,
                    (unsigned long long)dt2, (unsigned long long)dt);
     else
-        swprintf_s(b, L"polish: target does not support one-shot replace; text left as typed (model %llu ms)",
-                   (unsigned long long)dt);
+        swprintf_s(b, L"polish: no one-shot rewrite (%ls refused, model %llu ms); text left as typed",
+                   g_rewriteStage, (unsigned long long)dt);
     Log(L"WARN", b);
     // The rewrite was the closing writer for this mode and it just failed.
     // The text keeps every mark the speech model supplied - nothing is ever
@@ -3018,25 +3197,18 @@ static void RelaunchAndExit()
     if (g.state == kOn) SetState(kOff);
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(g.hInst, exe, MAX_PATH);
-    HANDLE self = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
-                         &self, SYNCHRONIZE, TRUE, 0)) {
-        Log(L"WARN", L"restart: could not duplicate process handle");
-        Notify(L"Could not restart.");
-        return;
-    }
+    // Nothing is inherited by the replacement instance. The child is told this process's id and
+    // opens it for synchronisation itself, which needs no handle sharing at all. Two alternatives
+    // were tried and measured: bInheritHandles=TRUE handed over every inheritable handle in the
+    // process (how the old code behaved), and adding PROC_THREAD_ATTRIBUTE_HANDLE_LIST did not
+    // restrict it - a child still received an unlisted event and could signal it.
     wchar_t cmd[MAX_PATH + 64]{};
-    swprintf_s(cmd, L"\"%s\" --wait-handle %llu", exe,
-               (unsigned long long)(uintptr_t)self);
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
+    swprintf_s(cmd, L"\"%s\" --wait-pid %lu", exe, (unsigned long)GetCurrentProcessId());
+    STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
-    // bInheritHandles=TRUE carries `self` to the child; safe because the
-    // mic/event handles are private to threads that die with us.
-    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE,
+    BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
                              DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
                              nullptr, nullptr, &si, &pi);
-    CloseHandle(self);
     if (!ok) {
         Log(L"WARN", L"restart: could not launch the new instance");
         Notify(L"Could not restart.");
@@ -3291,7 +3463,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // avgRms = ~40 s ambience average so steady hiss can never be the reference. Re-arm
             // at 30% of the ceiling but never within 1.6x of the hiss floor, and never below
             // 0.4% absolute.
-            g_eye.refRms = (std::max)(g_eye.refRms * 0.9983, g_audio.rms);
+            g_eye.refRms = (std::max)(g_eye.refRms * 0.9983, g_audio.rms.load());
             g_eye.avgRms += (g_audio.rms - g_eye.avgRms) * 0.0025;
             const double rearm = (std::max)({ 0.004, g_eye.avgRms * 1.6, g_eye.refRms * 0.30 });
             if (g.state == kOn && !g_eye.visible && g_audio.rms > rearm)
@@ -3371,16 +3543,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         int n = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &n);
         for (int i = 1; argv && i < n; ++i) {
-            if (!_wcsicmp(argv[i], L"--wait-handle") && i + 1 < n) {
-                HANDLE h = (HANDLE)(uintptr_t)_wcstoui64(argv[i + 1], nullptr, 10);
-                // The number is a claim from the command line, not a fact: anything this
-                // process does not already hold is refused instead of waited on and closed.
-                DWORD info = 0;
-                if (h && h != INVALID_HANDLE_VALUE && GetHandleInformation(h, &info)) {
-                    WaitForSingleObject(h, 15000);   // cap it: a wedged parent must not wed us
-                    CloseHandle(h);
-                } else if (h) {
-                    Log(L"WARN", L"restart: --wait-handle is not a handle of this process; ignored");
+            if (!_wcsicmp(argv[i], L"--wait-pid") && i + 1 < n) {
+                // The launching instance passes its process id, not a handle: nothing is
+                // inherited across the restart, so there is no handle to validate or close.
+                DWORD pid = (DWORD)wcstoul(argv[i + 1], nullptr, 10);
+                if (pid) {
+                    HANDLE hp = nullptr;
+                    // The parent is alive at this instant, but it may already be tearing down.
+                    for (int t = 0; t < 40 && !hp; ++t) {
+                        hp = OpenProcess(SYNCHRONIZE, FALSE, pid);
+                        if (!hp) Sleep(25);
+                    }
+                    if (hp) {
+                        WaitForSingleObject(hp, 15000);   // cap it: a wedged parent must not wed us
+                        CloseHandle(hp);
+                    } else {
+                        Log(L"WARN", L"restart: could not open the previous instance; starting anyway");
+                    }
                 }
             }
         }
@@ -3435,8 +3614,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 std::string raw;
                 if (h != INVALID_HANDLE_VALUE) {
-                    char buf[65536]; DWORD got;
-                    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got) raw.append(buf, got);
+                    // Heap, not a 64 KB stack frame: wWinMain's frame has to stay small.
+                    std::vector<char> buf(65536);
+                    DWORD got = 0;
+                    while (ReadFile(h, buf.data(), (DWORD)buf.size(), &got, nullptr) && got)
+                        raw.append(buf.data(), got);
                     CloseHandle(h);
                 }
                 if (!raw.empty() && raw.compare(0, 3, "\xEF\xBB\xBF") == 0) raw.erase(0, 3);
@@ -3595,7 +3777,69 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             DestroyWindow(top);
             if (argv) LocalFree(argv);
             CoUninitialize();
-            return 0;
+            return (textOk && ok) ? 0 : 1;
+        }
+        if (debug && !_wcsicmp(argv[i], L"--uia-rewrite")) {
+            // Automated check of the UIA one-shot rewrite against an external target that the
+            // harness owns: a Chromium page whose title carries the marker below. The test types
+            // into the marker window only after proving this process owns the foreground, so a
+            // failed focus grab can never spill keystrokes into whatever the user is doing.
+            const wchar_t* marker = L"TIRO-UIA-TARGET";
+            const wchar_t* raw = L"hello world this is raw dictated text without any punctuation at all";
+            const wchar_t* pol = L"Hello world. This is raw dictated text without any punctuation at all.";
+            struct Find { const wchar_t* m; HWND h; } fnd = { marker, nullptr };
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                Find* f = (Find*)lp;
+                wchar_t t[256] = L"";
+                if (!IsWindowVisible(h) || GetWindowTextW(h, t, 256) <= 0) return TRUE;
+                if (wcsstr(t, f->m)) { f->h = h; return FALSE; }
+                return TRUE; }, (LPARAM)&fnd);
+            if (!fnd.h) { Log(L"ERROR", L"uia-rewrite: FAIL no window carries the marker"); return 0; }
+            HWND top = fnd.h;
+            for (int t = 0; t < 20 && GetForegroundWindow() != top; ++t) {
+                keybd_event(VK_MENU, 0, 0, 0); keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+                SwitchToThisWindow(top, TRUE);
+                SetForegroundWindow(top);
+                Sleep(100);
+            }
+            if (GetForegroundWindow() != top) {
+                Log(L"ERROR", L"uia-rewrite: FAIL could not take the foreground; nothing typed");
+                return 0;
+            }
+            Sleep(300);
+            SendUnicode(raw);
+            {
+                // How long to leave between typing and the rewrite. Default 700 ms; the test
+                // sweep sets it low to reproduce "polish runs right after the last keystroke".
+                wchar_t sv[32] = L"";
+                DWORD n = GetEnvironmentVariableW(L"TIRO_UIA_SETTLE", sv, 32);
+                int settle = (n && n < 32) ? _wtoi(sv) : 700;
+                Sleep(settle ? settle : 1);
+            }
+            std::wstring pre = UiaFocusedValue(top);
+            wchar_t pb[520];
+            swprintf_s(pb, L"uia-rewrite: pre-rewrite value=\"%ls\"", pre.c_str());
+            Log(L"INFO", pb);
+            ULONGLONG t0 = GetTickCount64();
+            bool ok = RewriteViaUIAValue(top, raw, pol);
+            ULONGLONG ms = GetTickCount64() - t0;
+            std::wstring after = UiaFocusedValue(top);
+            // TIRO_UIA_EXPECT=raw asserts the documented behaviour for a target that cannot be
+            // rewritten (a Chromium contenteditable): the dictation is left exactly as typed.
+            wchar_t ev[16] = L"";
+            DWORD en = GetEnvironmentVariableW(L"TIRO_UIA_EXPECT", ev, 16);
+            bool expectRaw = (en && en < 16 && !_wcsicmp(ev, L"raw"));
+            bool pass = expectRaw ? (after == raw) : (ok && after == pol);
+            wchar_t b[640];
+            swprintf_s(b, L"uia-rewrite: %ls | expect=%ls | stage=%ls hr=0x%08lX | rewrite %s in %llu ms | value=\"%ls\"",
+                       pass ? L"PASS" : L"FAIL", expectRaw ? L"unchanged" : L"polished",
+                       g_rewriteStage, (unsigned long)g_rewriteHr,
+                       ok ? L"ok" : L"failed", (unsigned long long)ms, after.c_str());
+            Log(pass ? L"INFO" : L"ERROR", b);
+            // Close the harness's own target so the caller does not have to hunt the process;
+            // the app window owns the whole Chrome instance, so this ends it.
+            PostMessageW(top, WM_CLOSE, 0, 0);
+            return pass ? 0 : 1;
         }
         if (debug && !_wcsicmp(argv[i], L"--probe-focus")) {
             // Read-only interrogation of the control that currently has keyboard focus,
@@ -3727,6 +3971,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
                            !_wcsicmp(argv[i], L"--notify") || !_wcsicmp(argv[i], L"--startup-toggle") ||
                            !_wcsicmp(argv[i], L"--restart") || !_wcsicmp(argv[i], L"--selftest") ||
                            !_wcsicmp(argv[i], L"--live") || !_wcsicmp(argv[i], L"--rewrite-demo") ||
+                           !_wcsicmp(argv[i], L"--uia-rewrite") ||
                            !_wcsicmp(argv[i], L"--probe-focus") ||
                            !_wcsicmp(argv[i], L"--polish-file") || !_wcsicmp(argv[i], L"--polish-tokens");
         if (!debug) {

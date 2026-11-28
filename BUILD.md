@@ -187,7 +187,7 @@ layer.
    grey arc circles it while it loads for a few seconds, then a red glow along
    its lower edge means ready (that glow turns green while dictation is on).
    Right-click it, choose **About**, and it reads
-   `Tiro 1.1.0 (<hash>)` - the same hash as the `stamp:` line. That is how you
+   `Tiro 1.1.1 (<hash>)` - the same hash as the `stamp:` line. That is how you
    know you are running the code you just compiled. Headless equivalent, if you
    cannot use the tray:
 
@@ -195,14 +195,14 @@ layer.
    powershell -NoProfile -c "(Get-Item 'bin\Release\Tiro.exe').VersionInfo.FileVersion"
    ```
 
-   prints `1.1.0.0`; the commit hash itself is in that build's `src\gitver.h`
+   prints `1.1.1.0`; the commit hash itself is in that build's `src\gitver.h`
    and in the log's `startup:` line.
 
 4. **The engine loaded.** Open `%LOCALAPPDATA%\Tiro\logs\app.log`. It should
    contain
 
    ```text
-   startup: Tiro 1.1.0 (<hash>)
+   startup: Tiro 1.1.1 (<hash>)
    engine ready in .... ms (threads=1)
    ```
 
@@ -228,13 +228,13 @@ layer.
    app.log is shared by every build and session on the machine, so "the log
    contains that line" is not proof by itself - and rebuilding the same commit
    yields the same hash, so an older `startup:` line can match your stamp too.
-   Prove it was this run: take the **last** `startup: Tiro 1.1.0 (<hash>)` line
+   Prove it was this run: take the **last** `startup: Tiro 1.1.1 (<hash>)` line
    whose hash equals the build's `stamp:`, and require a `selftest final` line
    after it (debug mode logs the banner, core pinning, `engine ready` and
    `selftest: 6 s of audio` in between, so not immediately after).
 
    ```bat
-   findstr /N /C:"startup: Tiro 1.1.0" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
+   findstr /N /C:"startup: Tiro 1.1.1" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
    ```
 
    The line numbers make the order visible: the last `startup:` line carrying
@@ -273,8 +273,10 @@ SmartScreen prompt: **More info -> Run anyway**.
 
 The `build\` folder is scratch. A distributable zip is only produced by
 `make_release.bat <version>`, which additionally refuses to run on an
-uncommitted tree, checks the model files against `dist\models.sha256` (the
-pinned hashes of the weights that ship), and verifies the archive it wrote.
+uncommitted tree, refuses a version that disagrees with `kAppVersion`, the
+resource block or the changelog, checks the model files against
+`dist\models.sha256` (the pinned hashes of the weights that ship), and verifies
+the archive it wrote.
 
 ---
 

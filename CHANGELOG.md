@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.1
+
+* **The polished sentence now arrives in browsers.** In Chromium-based
+  applications the correction could be refused in the instant it was ready;
+  Tiro now waits for the application to catch up before making the change, so
+  the sentence you see is the punctuated one.
+* **Fast starts and stops stay in step.** Toggling dictation quickly could leave
+  the recogniser and the text on screen disagreeing; that hand-off is now
+  ordered, so the seam between two turns always reads the same way.
+* **A bad file or a stuck device can no longer take the app down.** Audio files
+  with impossible lengths are refused cleanly, and if a recording device stops
+  answering, that session is abandoned instead of touching memory it may still
+  be using.
+* **Hardened against tampered files.** The text engine is loaded only from the
+  Windows system folder, model files are checked against pinned hashes when a
+  release is built, and the binary is compiled with control-flow and address
+  randomisation protection enabled.
+
 ## 1.1.0
 
 * **Every sentence you dictate ends complete.** Stop dictating and the

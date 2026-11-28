@@ -31,8 +31,8 @@ BEGIN
 END
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,1,0,0
- PRODUCTVERSION 1,1,0,0
+ FILEVERSION 1,1,1,0
+ PRODUCTVERSION 1,1,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -45,11 +45,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Piyush Raizada"
             VALUE "FileDescription", "Tiro dictation"
-            VALUE "FileVersion", "1.1.0.0"
+            VALUE "FileVersion", "1.1.1.0"
             VALUE "InternalName", "Tiro"
             VALUE "OriginalFilename", "Tiro.exe"
             VALUE "ProductName", "Tiro"
-            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "ProductVersion", "1.1.1.0"
             VALUE "LegalCopyright", "Speech model licensed by NVIDIA Corporation under the NVIDIA Open Model License"
         END
     END

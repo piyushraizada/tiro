@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>TIRO-UIA-TARGET</title>
+<style>
+  body { font: 16px/1.4 system-ui, sans-serif; margin: 24px; }
+  h1 { font-size: 15px; font-weight: 600; opacity: .7; margin: 0 0 12px; }
+  #ce { width: 860px; height: 250px; padding: 8px; border: 1px solid #888; overflow: auto;
+        font: 16px/1.4 ui-monospace, monospace; outline: none; }
+  textarea { width: 100%; height: 260px; font: 16px/1.4 ui-monospace, monospace; box-sizing: border-box; }
+</style>
+<h1>Automated rewrite test target — do not close</h1>
+<div id="ce" contenteditable="true"></div>
+<textarea id="ta" style="display:none" placeholder="focus lands here automatically"></textarea>
+<script>
+  // ?mode=ce (default) -> contenteditable, like a chat composer. ?mode=ta -> textarea.
+  // autofocus is unreliable inside an --app window on a cold profile, so take focus explicitly.
+  const mode = new URLSearchParams(location.search).get('mode') || 'ce';
+  const prefill = new URLSearchParams(location.search).get('prefill') === '1';
+  const RAW = 'hello world this is raw dictated text without any punctuation at all';
+  const ce = document.getElementById('ce'), ta = document.getElementById('ta');
+  if (mode === 'ta') { ce.style.display = 'none'; ta.style.display = 'block'; }
+  const target = mode === 'ta' ? ta : ce;
+  const grab = () => target.focus();
+  addEventListener('load', () => {
+    // prefill=1 puts text in the control and the caret at its end, like a finished dictation.
+    if (prefill) {
+      if (mode === 'ta') ta.value = RAW; else ce.textContent = RAW;
+      const r = document.createRange();
+      r.selectNodeContents(target); r.collapse(false);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    }
+    grab();
+  });
+  setTimeout(grab, 300);
+  setTimeout(grab, 1200);
+</script>

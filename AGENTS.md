@@ -68,11 +68,11 @@ Exit code 0 alone proves nothing, and app.log is shared by every build and
 session on the machine, so prove the line came from this build:
 
 ```bat
-cmd.exe /c findstr /N /C:"startup: Tiro 1.1.0" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
+cmd.exe /c findstr /N /C:"startup: Tiro 1.1.1" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
 ```
 
 `/N` numbers the lines, so ordering is visible: take the **last**
-`startup: Tiro 1.1.0 (<hash>)` line whose hash equals the build's `stamp:` (or
+`startup: Tiro 1.1.1 (<hash>)` line whose hash equals the build's `stamp:` (or
 `git rev-parse --short HEAD`); a `selftest final:` line must appear after it.
 Not necessarily immediately - debug mode logs the banner, core pinning,
 `engine ready` and `selftest: 6 s of audio` in between.
@@ -92,8 +92,25 @@ Word accuracy is what matters; a missing final period is native model
 behaviour and is accepted.
 
 The self-test needs no microphone and no audio device, and `--debug` lifts the
-single-instance check, so it can run while a tray copy is live. There is no
-unit-test harness; do not invent one.
+single-instance check, so it can run while a tray copy is live.
+
+### Rewrite tests - automated, no clicking
+
+```bat
+cmd.exe /c tests\run-rewrite-tests.bat build\verify\Tiro.exe
+```
+
+Two end-to-end rewrites, real exit code (0 pass, 1 fail, 2 setup): a RICHEDIT50W
+control Tiro owns (classic `EM_REPLACESEL` path), then a Chromium page the script
+starts (`UIA ValuePattern` path). The second types only into a window whose title
+carries `TIRO-UIA-TARGET`, after proving this process owns the foreground, and
+closes that window when it finishes. When it refuses, the log names the check:
+`element-focus`, `element-window`, `no-value`, `no-value-qi`, `read-only`,
+`no-text`, `selection`, `splice`, `write`, `settle`.
+
+Measured limitation, not a bug to "fix" by guessing: a Chromium **contenteditable**
+exposes no `ValuePattern`, so the UIA rewrite cannot apply there and the sentence
+keeps the speech model's punctuation. `uia-target.html?mode=ce` reproduces it.
 
 ## Hard rules
 
@@ -107,11 +124,11 @@ unit-test harness; do not invent one.
 - **Do not commit** `models/`, the unpacked `third_party/*/` folder, `bin/`,
   `build/` or `src/gitver.h`. The 55 MB `.tar.xz` archive and the two C API
   headers **are** tracked on purpose.
-- **Do not re-add punctuation processing.** The self-written
-  middleware; the app injects raw model output. The optional polish model is
+- **Do not re-add punctuation processing.** The self-written middleware was
+  removed; the app injects raw model output. The optional polish model is
   opt-in and off by default - leave it optional.
 - **Behavioural code changes sync the spec**: update
-  `requirements_and_bdd.md` (new revision entry plus the affected BDD
+  `requirements_and_bdd.md` (the affected requirement text and its BDD
   scenarios) in the *same* commit.
 - **Documentation must match the binary.** If you change the tray states,
   notifications, hotkeys or diagnostics, update `dist/README.txt`,
@@ -127,13 +144,46 @@ unit-test harness; do not invent one.
 Only at release time, from a clean committed tree:
 
 ```bat
-cmd.exe /c make_release.bat 1.1.0
+cmd.exe /c make_release.bat 1.1.1
 ```
 
 It refuses a dirty tree, tags `v<version>`, stages `Tiro\`, writes
-`build\Tiro-1.1.0-win64.zip`, re-opens the zip to verify the entry list and the
+`build\Tiro-1.1.1-win64.zip`, re-opens the zip to verify the entry list and the
 exe hash, and writes a `.sha256` beside it. Builds are **not** zipped; never
 hand-zip a release.
+
+### Release checklist
+
+`make_release.bat` refuses a `<version>` that disagrees with `kAppVersion` in
+`src/main.cpp`, the `FILEVERSION` in `src/Tiro.rc`, or the `## <version>` heading
+in `CHANGELOG.md`, so the mechanical part cannot be forgotten. The rest is
+judgement, and only happens at release time:
+
+1. **Bump in four places** - `kAppVersion` (`src/main.cpp`), `FILEVERSION` and
+   `PRODUCTVERSION` (`src/Tiro.rc`), the `## <version>` entry in `CHANGELOG.md`
+   (end-user benefit language, never internal tickets), and the version line at
+   the top of `requirements_and_bdd.md`.
+   Then run `tests\run-rewrite-tests.bat build\verify\Tiro.exe` - it exits
+   non-zero on a rewrite regression, which is the one thing a build alone cannot
+   prove.
+2. **Re-read `SECURITY.md` against the binary.** It is the document IT reviews;
+   every row must still describe what the code does (clipboard, overlays, focus
+   checks, model hashes, component versions). A security statement that
+   describes a different program is worse than no statement.
+3. **Check every download reference names the real artifact.** `README.md` quotes
+   the pattern `Tiro-<version>-win64.zip`; `BUILD.md` and `PROVENANCE.md` show
+   example zip names. If `make_release.bat` ever changes the asset name, those
+   change in the same commit - a link to a file that does not exist is the one
+   bug a user cannot work around.
+4. **Model changed?** Regenerate `dist/models.sha256` deliberately, or the gate
+   stops the release (that is the gate working, not a bug).
+5. **New file anywhere?** It needs a row in `PROVENANCE.md`. A file with no
+   stated origin does not ship.
+6. **Quit the running Tiro**, then `build_release.bat` (it stamps the commit and
+   copies `SECURITY.md` beside the exe), then `make_release.bat <version>`.
+7. **Upload** the zip and its `.sha256` to a new GitHub release for the tag, mark
+   it Latest, and write the notes in the same end-user voice as `CHANGELOG.md`.
+   Publishing is the owner's call, never automatic.
 
 ## Where things are
 

@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 rem ===========================================================================
-rem  make_release.bat <version>      e.g.   make_release.bat 1.1.0
+rem  make_release.bat <version>      e.g.   make_release.bat 1.1.1
 rem
 rem  Turns an already-built, COMMITTED tree into the distributable artifact:
 rem    build\Tiro-<version>-win64.zip  (+ .sha256 beside it)
@@ -21,7 +21,7 @@ rem ===========================================================================
 
 set VER=%~1
 if "%VER%"=="" (
-    echo usage: make_release.bat ^<version^>    e.g.  make_release.bat 1.1.0
+    echo usage: make_release.bat ^<version^>    e.g.  make_release.bat 1.1.1
     exit /b 2
 )
 
@@ -45,6 +45,22 @@ if not "%STATUSSIZE%"=="0" (
 )
 for /f "usebackq delims=" %%h in (`%GITCMD% rev-parse --short HEAD`) do set HASH=%%h
 echo commit: !HASH!
+
+rem --- 1b. the version strings agree -----------------------------------------
+rem A release whose exe says one version, whose resource says another and whose
+rem changelog says a third is a support problem nobody can reproduce. Refuse to
+rem tag before the tag exists. The quote character is built with [char]34 so the
+rem PowerShell one-liner stays safe inside batch quoting.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$v = '%VER%'; $q = [char]34;" ^
+  "$m = Get-Content -Raw 'src\main.cpp';" ^
+  "if ($m -notmatch ('kAppVersion\s*=\s*L' + $q + [regex]::Escape($v) + $q)) { Write-Host ('error: src\main.cpp kAppVersion is not ' + $v); exit 1 };" ^
+  "$rc = 'FILEVERSION ' + (($v -split '\.') -join ',') + ',0';" ^
+  "$r = Get-Content -Raw 'src\Tiro.rc';" ^
+  "if (-not $r.Contains($rc)) { Write-Host ('error: src\Tiro.rc has no ' + $rc); exit 1 };" ^
+  "if (-not (Select-String -Path 'CHANGELOG.md' -Pattern ('^## ' + [regex]::Escape($v)) -Quiet)) { Write-Host ('error: CHANGELOG.md has no section for ' + $v); exit 1 };" ^
+  "Write-Host ('version: ' + $v + ' - exe, resource and changelog agree')"
+if errorlevel 1 exit /b 1
 
 rem --- 2. tag ----------------------------------------------------------------
 for /f "usebackq delims=" %%h in (`%GITCMD% rev-parse HEAD`) do set HEADFULL=%%h
@@ -169,4 +185,8 @@ for %%A in ("%OUT%") do (
 
 echo.
 echo next: upload %OUT% and %OUT%.sha256 to the GitHub release for v%VER%.
+echo        before that, the release checklist in AGENTS.md:
+echo          - README names the asset pattern Tiro-%VER%-win64.zip
+echo          - SECURITY.md still describes the binary you just built
+echo          - release notes written in the CHANGELOG voice
 exit /b 0

@@ -1,8 +1,8 @@
 # Tiro — Real-Time Dictation for Windows
 
-**Version 1.1.0**
+**Version 1.1.1**
 
-This is the specification for Tiro 1.1.0 as built and shipped. Every number and
+This is the specification for Tiro 1.1.1 as built and shipped. Every number and
 behaviour below is taken from the implementation (`src/main.cpp`,
 `src/punctuation.cpp`), and every requirement has at least one scenario in §7.
 
@@ -39,7 +39,7 @@ recognition, Unicode injection, microphone and model selection, a configurable
 hotkey, optional Startup registration, an optional punctuation rewrite, and the
 diagnostics needed to support all of it.
 
-### 2.2 Out of scope for 1.1.0
+### 2.2 Out of scope for 1.1.1
 
 - Remote Desktop, session switching, resume-from-sleep recovery.
 - Following the Windows default capture device *while* listening (§5.1.5).
@@ -136,7 +136,7 @@ Modal, centred, opened from the menu or `--debug --about`; it ends dictation
 first. Contents:
 
 ```
-Tiro 1.1.0 (<commit hash>)
+Tiro 1.1.1 (<commit hash>)
 
 Author:     Piyush Raizada
 Vibe coded with Hermes Agent (Nous Research), Qwen/Qwen3.8-Flash-Next
@@ -218,7 +218,7 @@ dialog instead of toggling dictation.
 5. **No live default-device following.** The default is resolved when capture
    opens — at turn-on and at a microphone change — not while listening. Plugging
    in a headset mid-dictation does not move the stream; an endpoint that
-   disappears surfaces through FR-1.7. This is a 1.1.0 limitation.
+   disappears surfaces through FR-1.7. This is a known limitation.
 6. **Device list.** Active capture endpoints only, by friendly name. Disabled,
    unplugged and ghost endpoints are not listed.
 7. **Device loss.** A failing `GetNextPacketSize` or a buffer flagged
@@ -328,7 +328,7 @@ dialog instead of toggling dictation.
 11. **Known limitation.** `SendInput` cannot deliver keystrokes to windows at a
     higher integrity level (elevated applications, secure desktop, Task Manager)
     and the OS reports no error; text for such a window is lost silently. This is
-    accepted for 1.1.0.
+    accepted.
 
 ### 5.5 FR-5 State machine and toggle
 
@@ -428,9 +428,9 @@ RMS), `PauseMs` 2400 (min 200), `MaxUtteranceMs` 20000, `Rule1Ms`/`Rule2Ms`
    link to the executable with its working directory set to the executable's
    folder, so `models\` resolves. No Run key is used; the menu check reflects the
    file's existence.
-4. **Restart.** Duplicates its own process handle, launches
-   `<exe> --wait-handle <handle>` detached and exits. The new process waits up to
-   15 s for the old one before taking the mutex.
+4. **Restart.** Launches `<exe> --wait-pid <pid>` detached and exits; nothing is
+   inherited across the hand-off, so the child opens the old process by id to
+   wait for it (up to 15 s) before taking the mutex.
 5. **Shutdown.** Injector stopped (5 s grace), engine unloaded, capture closed,
    hotkey unregistered, tray icon deleted, `shutdown` logged.
 
@@ -510,6 +510,7 @@ switches. It grants no privilege, starts no dictation, and touches neither
 | `--selftest <wav>` | Replays a WAV through the real recogniser (§5.11.1) |
 | `--live <wav> [--target <title>]` | Feeds a WAV into the live pipeline in the On state, optionally pinning a window by title, then keeps running |
 | `--rewrite-demo` | One-shot rewrite test against an owned RICHEDIT50W window; logs PASS/FAIL and quits |
+| `--uia-rewrite` | Types into the window titled `TIRO-UIA-TARGET` (a Chromium page the harness starts), runs the UIA rewrite, logs PASS/FAIL with the stage that refused, closes that window, exits 0/1 |
 | `--polish-file <in> <out>` | Runs the polish model over a UTF-8 file; exit 2 if the model will not load, 3 on I/O failure |
 | `--polish-tokens <in> <out>` | Dumps token ids for verifying the tokenizer |
 
@@ -599,7 +600,12 @@ expose a writable UIA `ValuePattern` are rewritten in one `SetValue` call,
 applied only after the raw
 span is verified to sit exactly where the caret left it; Tiro then waits for the
 accessibility tree to report the new value and places the caret at the end of
-the polished span, so dictation can continue from there. Targets matching
+the polished span, so dictation can continue from there. Because the
+accessibility tree can lag the last keystroke — Chromium exposes no
+`ValuePattern` at all for roughly the first 100 ms after a control takes focus —
+the handshake is retried for up to 400 ms before it counts as a refusal; a
+definitive answer (a read-only target, a caret that has moved) is never retried.
+Targets matching
 neither are left exactly as typed; Tiro never borrows the clipboard and never
 sends backspace or selection keystrokes.
 

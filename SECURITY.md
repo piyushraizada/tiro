@@ -52,10 +52,13 @@ writes the dictated words to the log.
 
 The diagnostic switches (`--about`, `--hotkey`, `--notify`, `--startup-toggle`,
 `--restart`, `--selftest <wav>`, `--live <wav>`, `--polish-file`,
-`--polish-tokens`, `--rewrite-demo`, `--probe-focus`) are **inert unless
-`--debug` is also on the command line**, and they grant no privilege: they read
-and write only the file paths they are given. A normal launch of `Tiro.exe`
-never sets `--debug`.
+`--polish-tokens`, `--rewrite-demo`, `--uia-rewrite`, `--probe-focus`) are
+**inert unless `--debug` is also on the command line**, and they grant no
+privilege: they read and write only the file paths they are given. Two of them
+type: `--rewrite-demo` types into a window it creates itself, and
+`--uia-rewrite` types only into a window whose title contains
+`TIRO-UIA-TARGET`, after verifying that the process owns the foreground — a
+normal launch of `Tiro.exe` never sets `--debug` and has neither switch.
 
 ## Build hardening
 

@@ -18,7 +18,7 @@ Most voice-to-text tools send your voice recordings to a server (the cloud). Thi
 ## 🚀 Get Tiro (In 3 Simple Steps)
 You don't need to be a "tech person" to use Tiro. It is designed to work out of the box.
 
-1.  **Download & Unzip:** Grab the latest `Tiro.zip` from the [Releases page](https://github.com/piyushraizada/tiro/releases) and unzip it to any location on your computer (like your Desktop or Documents).
+1.  **Download & Unzip:** Grab the latest release zip from the [Releases page](https://github.com/piyushraizada/tiro/releases) - it is named `Tiro-<version>-win64.zip`, with a matching `.sha256` beside it - and unzip it to any location on your computer (like your Desktop or Documents).
 2.  **Run the App:** Double-click `Tiro.exe`. Once it's running, it sits quietly in your system tray (the area near your clock) waiting for you. Windows may warn once that the app is unsigned — choose "More info", then "Run anyway".
 3.  **Read the Manual:** Open **`README.txt`** inside the Tiro folder. It is the complete guide for end users: first dictation, microphone and hotkey setup, the tray menu, punctuation options (including the optional AI upgrade), troubleshooting, and clean removal.
 

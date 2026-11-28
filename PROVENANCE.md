@@ -25,6 +25,10 @@ licence the author chose for the whole work (section 2).
 | `dist/README.txt`, `dist/NOTICE.txt` | end-user manual and attribution notices |
 | `dist/LICENSE.txt` | a compilation, assembled here, of the third-party texts in section 3 |
 | `dist/models.sha256` | the pinned SHA-256 of every file in the shipped speech model; `make_release.bat` refuses to package a model that does not match it, and the file ships in the zip as `models/nemotron-0.6b-en/SHA256SUMS.txt` |
+| `tests/uia-target.html` | the browser page the automated rewrite test drives: one `contenteditable` and one `textarea`, titled `TIRO-UIA-TARGET` so `--uia-rewrite` can find it |
+| `tests/run-rewrite-tests.bat` | the automated rewrite regression: classic-edit test, then the Chromium test above; exits non-zero on failure |
+| `tests/caps/*` | capture harness for the venue/overlay checks (frames, montage, runner) |
+| `test/fixtures/punct_selftest.wav` | recorded fixture for `--selftest` |
 
 ## 2. The work itself
 
@@ -73,7 +77,7 @@ Model source: <https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b>
 
 ```bash
 git ls-files | sed 's/.*\.//' | sort | uniq -c | sort -rn     # what kinds of files ship
-python -c "import zipfile;[print(n) for n in zipfile.ZipFile('build/Tiro-1.1.0-win64.zip').namelist()]"
+python -c "import zipfile;[print(n) for n in zipfile.ZipFile('build/Tiro-1.1.1-win64.zip').namelist()]"
 git grep -niE '<character>|<film>|<studio>|<brand>' -- . ':!third_party/*.tar.xz'   # expect nothing
 strings bin/Release/Tiro.exe | grep -iE 'https?://|copyright' | sort -u             # foreign code inside
 ```
