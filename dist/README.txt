@@ -98,12 +98,13 @@ says exactly that instead of going quiet.
 It is OFF by default. To try it: right-click the tray icon,
 un-tick "Disable Punctuation", and restart Tiro - it will confirm that on
 the spot, because it never interrupts a dictation mid-sentence. When armed,
-the replacement happens in one step: Tiro selects the words you just dictated
-and pastes the polished version over them.
-It briefly borrows your clipboard for this and puts your original clipboard back
-afterwards (avoid copying anything in the split second it takes). This touches
-only the text you just dictated; undo (Ctrl+Z) still works afterwards. Re-checking
-"Disable Punctuation" turns the pass off again, again from the next start.
+the moment you stop dictating, Tiro turns the words you just spoke into
+their finished form in one seamless step: no clipboard, nothing visibly
+selected, and the cursor stays right where you left it so you can keep
+dictating. Where an application does not accept that seamless replacement,
+your text keeps the punctuation you spoke as-is, and Tiro still closes the
+sentence for you. Un-ticking the menu item is not needed - ticking
+"Disable Punctuation" again turns the pass off, from the next start.
 
 Notifications (an error, an instruction) appear for five seconds and dismiss
 themselves.

@@ -1,18 +1,21 @@
 # Changelog
 
-## 1.1.0 (rc1)
+## 1.1.0
 
-* **Dictate with confidence.** Tiro no longer touches text you have already
-  typed. What you dictate stays exactly as you left it.
-* **Punctuation appears in one clean instant.** In supported applications,
-  your words land as you speak and polished punctuation arrives in a single,
-  seamless update when you stop — nothing selected, nothing removed, nothing
-  retyped.
-* **Works in more places.** This seamless experience now includes web-based
-  applications, not just classic editors.
-* **When an application cannot take the seamless update, Tiro stays out of
-  the way** — your text is left untouched, with the punctuation the speech
-  model gives it.
+* **Every sentence you dictate ends complete.** Stop dictating and the
+  sentence closes itself: the period arrives, the next sentence starts with
+  its capital, and the seam between them reads like typing.
+* **Your first words are never lost again.** Slow-to-respond applications
+  used to swallow whatever you said the instant the hotkey went down; Tiro
+  now hears you the moment you press it.
+* **Punctuation is never lost.** Your words keep the punctuation as you
+  speak it, and where an application accepts the seamless polish, the
+  finished form replaces it in one clean instant — nothing selected,
+  nothing removed, nothing retyped. Where an application refuses, what you
+  spoke stands exactly as written, period included.
+* **Works in more places.** Full support now spans Word, Chrome and other
+  Chromium apps, Notepad++, VS Code and Antigravity — including their chat
+  panels — and classic text edit controls.
 
 ## 1.0.0
 

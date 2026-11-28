@@ -39,7 +39,7 @@
 #pragma comment(lib, "uiautomationcore.lib")
 
 static const wchar_t* kAppName    = L"Tiro";
-static const wchar_t* kAppVersion = L"1.1.0-rc1";
+static const wchar_t* kAppVersion = L"1.1.0";
 // A build's true identity is the commit it was compiled from. build_release.bat stamps it
 // into src/gitver.h (generated, ignored) before every build; dirty trees get a -dirty tail.
 // Rebuilding from the same commit always yields the same string - which a build counter never could.
