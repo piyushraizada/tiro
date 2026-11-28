@@ -526,8 +526,17 @@ static std::condition_variable g_polishCv;
 static bool g_delivering = false;               // a Deliver is inside SendUnicode right now
 static std::atomic<bool> g_polishCancel{ false };
 static bool g_polishEnabled = false;
-static bool g_sessionPolish = false;   // this session relies on the punctuation model
+static std::atomic<bool> g_sessionPolish{ false };   // this session relies on the punctuation model
+static std::atomic<bool> g_probePending{ false };    // capability probe running in the background
+static bool g_uttStarted = false;      // anything typed since the session started
+                                       // (reset at every TurnOn, not just engine start)
+static wchar_t g_lastInjected = 0;     // last char queued for injection (see QueueInject)
+static wchar_t g_docTail = 0;          // last char typed, surviving queue clears
+static HWND g_prevSessionTarget = nullptr;   // window the last session typed into
 static bool TargetSupportsOneShot(HWND top);   // defined with the rewrite paths
+struct ModeProbeCtx { HWND target; unsigned long long gen; };
+static DWORD WINAPI ModeProbeThread(LPVOID p); // decides it away from the microphone
+static std::atomic<unsigned long long> g_sessionGen{ 0 };  // probe results belong to one session
 
 static const wchar_t* OpenErrorMessage(HRESULT hr)
 {
@@ -715,15 +724,35 @@ static void TurnOn()
     }
     g.onAt = GetTickCount64();
     g.targetFocused = TargetHasFocus();
-    // One punctuation writer per session (spec 6.7): when the target can take the
-    // one-shot rewrite, ASR-supplied marks are stripped at injection and the
-    // punctuation model rewrites once at stop; when it cannot (or the capability
-    // cannot be established in time), nothing is stripped and no polish runs, so
-    // the user keeps exactly the punctuation the speech model provides.
-    g_sessionPolish = g_polishEnabled && TargetSupportsOneShot(g.target);
-    Log(L"INFO", g_sessionPolish
-        ? L"polish mode: punctuation model (target supports one-shot replace)"
-        : L"polish mode: speech-model punctuation (target does not support one-shot replace)");
+    // One punctuation authority per session (spec 6.7): when the target can take the
+    // one-shot rewrite, the punctuation model owns the FINAL form at stop; when it
+    // cannot (or the capability cannot be established in time), the speech model's
+    // punctuation stands as typed. Live text keeps the model's marks in both cases -
+    // nothing is stripped, so a refused rewrite can never leave punctuation lost.
+    // The engine lives across sessions, but every session is a new sentence:
+    // the session's first word gets its separating space, its capital letter,
+    // and the closing period at stop. g_lastInjected deliberately survives the
+    // reset - it is how the first word learns whether a space is owed at all.
+    // With the decoder retired per session, the model no longer trails a space
+    // across the seam, so when resuming in the SAME window the remembered last
+    // typed character stands in for it; a different window starts fresh.
+    if (g_docTail && g.target == g_prevSessionTarget) g_lastInjected = g_docTail;
+    g_prevSessionTarget = g.target;
+    g_uttStarted = false;
+    // The capability probe must never delay the microphone: accessibility into an
+    // Electron window takes up to its 700 ms budget, and every one of those
+    // milliseconds is the user's first words unheard (measured live: a session
+    // that began speaking instantly lost its first three words to the probe).
+    // The probe runs on its own thread now; nothing reads the answer before the
+    // stop, and the stop waits for it. Live text is identical in both modes, so
+    // the session itself never pauses for this decision.
+    g_probePending = true;
+    {
+        ModeProbeCtx* ctx = new ModeProbeCtx{ g.target, ++g_sessionGen };
+        HANDLE probeTh = CreateThread(nullptr, 0, ModeProbeThread, ctx, 0, nullptr);
+        if (probeTh) CloseHandle(probeTh);
+        else { delete ctx; g_probePending = false; g_sessionPolish = g_polishEnabled && TargetSupportsOneShot(g.target); }
+    }
     SetState(kOn);
     Log(L"INFO", L"dictation on: capture open at 16 kHz mono");
     ShowEyeball();
@@ -1242,9 +1271,6 @@ static void MarkSessionBoundary()
     g_engine.cutTyped = t.size();
 }
 
-static bool g_uttStarted = false;    // anything typed since the last reset
-static wchar_t g_lastInjected = 0;   // last char queued for injection (see QueueInject)
-
 // What the decoder hears is what gets typed. (Rev 28 added a deterministic punctuation
 // middleware here; Rev 31 removed it for the first release - Nemotron's own punctuation
 // ships instead, and the optional polish model remains the only rewriting pass.)
@@ -1399,6 +1425,28 @@ static DWORD WINAPI EngineThread(LPVOID)
             if (g_engine.drain && g_engine.q.empty()) {
                 // Rev 30: user stopped; everything captured so far is now decoded. Release the
                 // middleware after the drained words so the punctuation lands in order.
+                // Rev 33: and wrap up. A finished-flag alone decodes nothing - the transducer
+                // is never "ready" once samples run dry - so hand it half a second of silence:
+                // the endpointer fires, the lookahead completes, and the last words come out of
+                // the normal path. Then declare the input finished for good, flush once more,
+                // and deliver everything through the still-open drain. The stream is then
+                // retired: each session starts on a clean decoder, so a previous session's
+                // trailing marks or a long day's drift can never leak into the next sentence.
+                {
+                    std::vector<float> sil(8000, 0.0f);   // 500 ms at 16 kHz
+                    SherpaOnnxOnlineStreamAcceptWaveform(g_engine.stream, 16000, sil.data(), (int)sil.size());
+                    while (SherpaOnnxIsOnlineStreamReady(g_engine.rec, g_engine.stream))
+                        SherpaOnnxDecodeOnlineStream(g_engine.rec, g_engine.stream);
+                    DeliverStreamDelta();
+                }
+                SherpaOnnxOnlineStreamInputFinished(g_engine.stream);
+                while (SherpaOnnxIsOnlineStreamReady(g_engine.rec, g_engine.stream))
+                    SherpaOnnxDecodeOnlineStream(g_engine.rec, g_engine.stream);
+                DeliverStreamDelta();
+                SherpaOnnxDestroyOnlineStream(g_engine.stream);
+                g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
+                g_typed.clear();
+                g_engine.cutTyped = 0;
                 g_engine.drain = false;
                 drainDone = true;
                 drainPolish = g_engine.drainPolish;
@@ -1411,6 +1459,14 @@ static DWORD WINAPI EngineThread(LPVOID)
                 Log(L"WARN", L"drain: deadline passed, the rest of the backlog is dropped");
                 DropPendingAudio();
                 lk.lock();
+                // The decoder consumed some of a backlog that never finished arriving;
+                // it is not a safe foundation for the next sentence either. Clean slate.
+                if (g_engine.stream) {
+                    SherpaOnnxDestroyOnlineStream(g_engine.stream);
+                    g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
+                    g_typed.clear();
+                    g_engine.cutTyped = 0;
+                }
                 drainDone = true;
             }
             buf.assign(g_engine.q.begin(), g_engine.q.end());
@@ -1502,6 +1558,16 @@ static DWORD WINAPI EngineThread(LPVOID)
             // through the injector while the drain is still active (after it
             // releases, the injector refuses all text by design), and the drain
             // stays open until the period is actually in the document.
+            // The mode was decided on the microphone's behalf, possibly still in
+            // flight. Wait for the verdict before choosing which writer closes
+            // the sentence - it cannot outlast the probe's own 700 ms budget.
+            for (ULONGLONG pw = GetTickCount64() + 1500; g_probePending && GetTickCount64() < pw; )
+                Sleep(20);
+            if (g_probePending) Log(L"WARN", L"polish: capability probe still running at stop; assuming speech mode");
+            // A stop that beat the probe armed the drain with the provisional
+            // answer; re-read the verdict now that the wait is over, so a
+            // supported target never loses its rewrite to a stopwatch.
+            if (g_polishEnabled && g_sessionPolish) drainPolish = true;
             if (!g_sessionPolish && g_uttStarted) {
                 wchar_t last = 0;
                 { std::lock_guard<std::mutex> il(g_injectMu); last = g_lastInjected; }
@@ -1893,6 +1959,26 @@ static void Deliver(const std::wstring& text)
     g_polishCv.notify_all();
 }
 
+// The stop hotkey races the last keystrokes: while Ctrl/Alt/Shift/Win are logically
+// held, the OS reinterprets injected characters as shortcut attempts - Word eats them
+// silently, AltGr-flavoured layouts translate them into other characters. Any text
+// typed near a hotkey press must therefore wait for the modifiers to come up. When
+// nothing is held (almost always) this returns on the first check.
+static void WaitForModifierRelease()
+{
+    static const int mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN };
+    ULONGLONG t0 = GetTickCount64();
+    bool held = false;
+    for (;;) {
+        held = false;
+        for (int m : mods)
+            if (GetAsyncKeyState(m) & 0x8000) { held = true; break; }
+        if (!held || GetTickCount64() - t0 > 1500) break;
+        Sleep(10);
+    }
+    if (held) Log(L"WARN", L"inject: modifier still held after 1.5s, typing anyway");
+}
+
 static DWORD WINAPI InjectorThread(LPVOID)
 {
     for (;;) {
@@ -1929,6 +2015,7 @@ static DWORD WINAPI InjectorThread(LPVOID)
             }
             Log(L"INFO", L"inject: focus returned to the target for the drained tail");
         }
+        WaitForModifierRelease();   // the tail must land as text, never as shortcuts
         ULONGLONG t0 = GetTickCount64();
         Deliver(text);
         ULONGLONG dt = GetTickCount64() - t0;
@@ -1943,50 +2030,38 @@ static void StartInjector()
     g_injectThread = CreateThread(nullptr, 0, InjectorThread, nullptr, 0, nullptr);
 }
 
-// A pause now ends a segment, so one spoken sentence can arrive as several pieces. The model's
-// raw text has no trailing space, so concatenating them gives "nowI feelIt has been" in the
-// target. One space between pieces is a delimiter, not formatting: nothing is added inside a
-// segment, nothing at the start of a session, and nothing if a piece already begins or the last
-// one ended with whitespace.
-
-// When the session's punctuation comes from the punctuation model, the speech
-// model's own marks are removed here so exactly one writer punctuates: the model
-// at stop. Digit-embedded marks (. in 3.14, , in 1,000, : in ratios) survive,
-// matching the punctuation pass's own keep rule.
-static bool IsAsrMark(wchar_t c)
-{
-    static const wchar_t* m = L".,;:!?\uFF0C\u3002\uFF1A\uFF1F\uFF01\uFF1B\u2026\u0964\u0965\u06D4";
-    return wcschr(m, c) != nullptr;
-}
-
-static void StripAsrMarks(std::wstring& s)
-{
-    std::wstring o;
-    o.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        wchar_t c = s[i];
-        if (IsAsrMark(c)) {
-            bool keep = (c == L'.' || c == L',' || c == L':') &&
-                        i > 0 && i + 1 < s.size() &&
-                        iswdigit(s[i - 1]) && iswdigit(s[i + 1]);
-            if (keep) o.push_back(c);
-            continue;
-        }
-        o.push_back(c);
-    }
-    s.swap(o);
-}
+// One space between segments is a delimiter, not formatting: nothing is added
+// inside a segment, nothing at the start of a session, and nothing if a piece
+// already begins or the last one ended with whitespace. The speech model's own
+// punctuation flows through untouched in every mode - see QueueInject.
 
 static void QueueInject(const std::wstring& text, bool sep)
 {
     if (text.empty()) return;
     std::wstring out = text;
-    if (g_sessionPolish) StripAsrMarks(out);
-    if (out.empty()) return;
-    if (!g_sessionPolish && !g_uttStarted) {
+    if (!g_uttStarted) {
+        // The decoder stream runs on across sessions; the '.' that finally closes
+        // the previous utterance frequently arrives as this session's first token.
+        // Tiro already put that sentence's period in at stop, so a leading dot is
+        // a duplicate of the mark sitting in the document - drop it, keep one
+        // space so the seam stays readable. A new sentence never legitimately
+        // starts with '.', so this cannot eat anything the user meant.
+        if (g_docTail == L'.' || g_docTail == L'!' || g_docTail == L'?') {
+            std::wstring kept;
+            size_t i = 0;
+            for (; i < out.size(); ++i) {
+                if (out[i] != L'.' && !iswspace(out[i])) break;
+                if (iswspace(out[i]) && kept.empty()) kept.push_back(L' ');
+            }
+            kept += out.substr(i);
+            if (kept.empty()) return;   // the chunk was only the previous session's mark
+            out.swap(kept);
+        }
         // Speech-mode contract, one sentence per session: because Tiro closes
         // every session with a period (see the drain end), it also opens one.
-        // Capitalize the first letter the session types, whatever Nemotron sent.
+        // Capitalize the first letter the session types, whatever Nemotron sent;
+        // when the target takes the rewrite path, the polished form simply
+        // repeats what is already there.
         for (wchar_t& ch : out)
             if (iswalpha(ch)) { ch = (wchar_t)towupper(ch); break; }
     }
@@ -1995,6 +2070,7 @@ static void QueueInject(const std::wstring& text, bool sep)
         bool needSpace = sep && g_lastInjected != 0 && !iswspace(g_lastInjected) && !iswspace(text[0]);
         if (needSpace) out.insert(out.begin(), L' ');
         g_lastInjected = out.back();
+        g_docTail = out.back();
         if (g_injectQ.size() >= 16) {
             g_injectQ.pop_front();
             Log(L"WARN", L"inject: queue full, dropped the oldest segment");
@@ -2322,6 +2398,10 @@ static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring&
     if (!GetClassNameW(ed, cls, 40)) return false;
     for (size_t i = 0; cls[i]; ++i)
         if (cls[i] >= L'A' && cls[i] <= L'Z') cls[i] = wchar_t(cls[i] - L'A' + L'a');
+    // RichEditD2DPT: the D2D-rendered editor hosting Windows 11's Store Notepad.
+    // It passes class checks like a RichEdit but refuses the replace messages -
+    // and corrupts injected keystrokes outright. Never rewrite through it.
+    if (wcsstr(cls, L"d2dpt")) return false;
     const bool rich = wcsstr(cls, L"richedit") != nullptr;
     const bool edit = !rich && wcscmp(cls, L"edit") == 0;
     if (!rich && !edit) return false;
@@ -2458,13 +2538,16 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
         HRESULT setHr = nvB ? vp->SetValue(nvB) : E_OUTOFMEMORY;
         if (nvB) SysFreeString(nvB);
         if (FAILED(setHr)) break;
-        ok = true;
 
         // Whole-value writes leave the caret wherever the provider likes, and the
         // accessibility tree refreshes asynchronously. Poll the fresh document
         // range until it reports the new value, then walk back over the untouched
         // tail and select the zero-length range: caret lands right after the
         // polished span so dictation can continue from there.
+        // The write itself is not the proof: some providers (Antigravity's chat
+        // box) accept SetValue and never apply it. Success means the text model
+        // reported the new value; anything else is a refusal, reported as one.
+        bool settled = false;
         ULONGLONG caretT0 = GetTickCount64();
         for (int attempt = 0; GetTickCount64() - caretT0 < 1000; ++attempt) {
             IUIAutomationTextRange* doc2 = nullptr;
@@ -2473,7 +2556,7 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
             std::wstring docTxt;
             if (SUCCEEDED(doc2->GetText(-1, &dv))) docTxt = dv ? dv : L"";
             if (dv) SysFreeString(dv);
-            bool settled = (docTxt == nv);
+            settled = (docTxt == nv);
             if (settled) {
                 IUIAutomationTextRange* caret = nullptr;
                 if (SUCCEEDED(doc2->Clone(&caret)) && caret) {
@@ -2493,6 +2576,8 @@ static bool RewriteViaUIAValue(HWND target, const std::wstring& raw, const std::
             doc2->Release();
             Sleep(40);
         }
+        if (!settled) Log(L"WARN", L"polish: uia-value write was accepted but never appeared; treating as refusal");
+        ok = settled;
     } while (false);
     if (bstr) SysFreeString(bstr);
     if (pre) pre->Release();
@@ -2580,6 +2665,10 @@ static bool TargetSupportsOneShot(HWND top)
     if (fe) {
         wchar_t cls[32]{};
         GetClassNameW(fe, cls, 32);
+        // See RewriteViaReplaceSel: D2DPT hosts answer class checks but refuse
+        // real work; declare them unsupported up front so the session keeps the
+        // speech model's own punctuation and the closing-period rule.
+        if (wcsstr(cls, L"D2DPT") || wcsstr(cls, L"d2dpt")) return false;
         if (_wcsicmp(cls, L"Edit") == 0 || wcsstr(cls, L"RICHEDIT")) return true;
     }
     CapProbe probe{ top, false, CreateEventW(nullptr, TRUE, FALSE, nullptr) };
@@ -2592,6 +2681,24 @@ static bool TargetSupportsOneShot(HWND top)
     }
     CloseHandle(probe.done);
     return ok;
+}
+
+// The mode decision runs here so TurnOn returns to opening the microphone
+// immediately. A result is only allowed to land for the session that started
+// this probe; a stale probe from a superseded session logs and withdraws.
+static DWORD WINAPI ModeProbeThread(LPVOID p)
+{
+    ModeProbeCtx* ctx = (ModeProbeCtx*)p;
+    bool ok = g_polishEnabled && TargetSupportsOneShot(ctx->target);
+    if (g_sessionGen == ctx->gen) {
+        g_sessionPolish = ok;
+        g_probePending = false;
+    }
+    delete ctx;
+    Log(L"INFO", ok
+        ? L"polish mode: punctuation model (target supports one-shot replace)"
+        : L"polish mode: speech-model punctuation (target does not support one-shot replace)");
+    return 0;
 }
 
 struct PolishJob { HWND target; std::wstring text; };
@@ -2655,7 +2762,35 @@ static DWORD WINAPI PolishThread(LPVOID p)
     else
         swprintf_s(b, L"polish: target does not support one-shot replace; text left as typed (model %llu ms)",
                    (unsigned long long)dt);
-    Log(L"INFO", b);
+    Log(L"WARN", b);
+    // The rewrite was the closing writer for this mode and it just failed.
+    // The text keeps every mark the speech model supplied - nothing is ever
+    // stripped - but the model's final period is exactly what streaming
+    // drops, so repay that one mark from own pocket: type it at the caret
+    // (which the failed rewrite never moved). Re-open the drain window around
+    // it, since the injector refuses text once dictation has fully closed.
+    // If the model did supply a trailing mark, this stays silent.
+    if (g_uttStarted) {
+        wchar_t last = 0;
+        { std::lock_guard<std::mutex> il(g_injectMu); last = g_lastInjected; }
+        if (iswalnum(last)) {
+            g_drainActive = true;
+            QueueInject(L".", false);
+            Log(L"INFO", L"polish fallback: closing period typed instead");
+            ULONGLONG pl = GetTickCount64() + 800;
+            for (;;) {
+                bool idle = false;
+                { std::lock_guard<std::mutex> il(g_injectMu); idle = g_injectQ.empty(); }
+                { std::lock_guard<std::mutex> pl2(g_polishMu); if (idle && !g_delivering) break; }
+                if (GetTickCount64() > pl) {
+                    Log(L"WARN", L"polish fallback: closing period still queued at close");
+                    break;
+                }
+                Sleep(20);
+            }
+            g_drainActive = false;
+        }
+    }
     delete job;
     return 0;
 }

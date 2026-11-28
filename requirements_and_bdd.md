@@ -592,14 +592,47 @@ the polished span, so dictation can continue from there. Targets matching
 neither are left exactly as typed; Tiro never borrows the clipboard and never
 sends backspace or selection keystrokes.
 
-Exactly one writer punctuates per session, decided when dictation turns on: if
-the target supports the one-shot rewrite, marks supplied by the speech model are
-stripped at injection and the punctuation model rewrites once at stop; if the
-target does not support it — or the capability cannot be established within
-700 ms, since accessibility queries into a broken provider can hang — the speech
-model's own punctuation is injected untouched and no polish pass runs, so the
-user always gets at least the punctuation the speech model provides. The mode
-chosen is logged at every turn-on.
+Exactly one punctuation authority acts per session, decided when dictation
+turns on: if the target supports the one-shot rewrite, the punctuation model
+owns the FINAL form, applied once at stop; if the target does not support it —
+or the capability cannot be established within 700 ms, since accessibility
+queries into a broken provider can hang — the speech model's own punctuation
+stands as typed and no polish pass runs. In both modes the live text carries
+exactly what the speech model dictated: nothing is stripped on the way in, so
+a rewrite that later fails can never leave punctuation lost. The capability
+check runs beside dictation, never before it — a stop waits for its verdict —
+because a microphone kept waiting on accessibility loses the first words
+spoken. A whole-value write counts as applied only when the text model reports
+the new value back; a provider that accepts the write and never shows it
+(measured in the wild, in an Electron chat input) is treated as a refusal. The
+mode chosen is logged for every session.
+
+In speech-model mode the session is a sentence: users stop dictation at logical
+sentence ends, so Tiro owns that boundary. On a **user** stop only, if the last
+injected character was word-like, a closing period is written before the drain
+closes; forced stops type nothing further. The session's first letter is
+capitalised whatever the speech model sent — in every mode, since one rewrite
+confirms it rather than fights it — and when the decoder stream — which
+runs on across sessions — finally closes the previous utterance with a "."
+that arrives as the next session's first token, it is dropped: it duplicates a
+mark Tiro has already written, and a new sentence never legitimately begins
+with one. One space survives at each seam. On a supported target the closing
+period is the rewrite's own work; if that rewrite is nonetheless refused, the
+period is typed at the caret instead, so every user stop ends as a sentence no
+matter which writer the app honours.
+
+A user stop finishes the sentence all the way down to the decoder: the
+microphone closes immediately, everything already captured keeps flowing,
+the stream is then fed half a second of silence so the endpointer fires and
+held-back final words are completed into the document, and only then does the
+closing period go in. The decoder stream is retired at that point — every
+dictation session begins on a clean recogniser, so no mark, space, or drift
+from a previous sentence can leak into the next. Seam spacing is therefore
+Tiro's own promise: resuming in the same window, the remembered last typed
+character decides whether the session's first word owes a space. Before any
+keystroke goes out, Tiro waits for the hotkey's modifier keys to be released:
+a tail typed while Ctrl or Alt is still logically held would be reinterpreted
+as a shortcut and silently lost.
 
 Failure is always safe: if the model is not ready, the output is empty, the
 target is no longer foreground, the target does not support the one-shot
@@ -996,21 +1029,30 @@ Scenario: Chromium rewrite leaves the caret ready for more dictation
   And the user can continue dictating from that point
   And the log records "polish: <a> chars -> <b> chars via uia-value in <n> ms"
 
-Scenario: An unsupported target keeps its text
+Scenario: An unsupported target keeps its text and gains its period
   Given punctuation is enabled and ready
   And the target exposes neither a classic edit control nor a writable UIA value pattern
   When the user stops dictating with the hotkey
-  Then the dictated text remains exactly as injected
+  Then the dictated text remains exactly as injected apart from the closing period
   And the log records "polish: target does not support one-shot replace"
 
-Scenario: A supported target silences speech-model punctuation
+Scenario: A supported target silences nothing and rewrites once
   Given punctuation is enabled and ready
   And the target supports the one-shot rewrite
   When the user dictates and the speech model supplies punctuation inline
-  Then the injected text carries none of those marks (digit-embedded marks excepted)
+  Then the injected text carries those marks exactly as supplied
   And the log records "polish mode: punctuation model (target supports one-shot replace)"
   When the user stops dictating with the hotkey
   Then the text is rewritten once by the punctuation model
+
+Scenario: A provider that swallows the write falls back honestly
+  Given punctuation is enabled and ready
+  And the target exposes a writable UIA value pattern that never applies writes
+  When the user stops dictating with the hotkey
+  Then the log records "polish: uia-value write was accepted but never appeared; treating as refusal"
+  And the dictated text keeps the punctuation as injected
+  And a closing period is typed at the caret
+  And the log records "polish fallback: closing period typed instead"
 
 Scenario: An unsupported target keeps speech-model punctuation
   Given punctuation is enabled and ready
@@ -1020,6 +1062,17 @@ Scenario: An unsupported target keeps speech-model punctuation
   And the log records "polish mode: speech-model punctuation (target does not support one-shot replace)"
   When the user stops dictating with the hotkey
   Then no polish pass runs
+
+Scenario: A speech-mode session ends as a sentence
+  Given punctuation is enabled and ready
+  And the target does not support the one-shot rewrite
+  When the user dictates a sentence and stops with the hotkey
+  Then the session's first letter appears capitalised
+  And the sentence ends with a period
+  And the log records "session end: closing period added"
+  When the user dictates another sentence in the same document and stops
+  Then the seam carries one space and no duplicated period
+  And a forced stop adds neither period nor space
 ```
 
 ### Feature: Capability boundaries
