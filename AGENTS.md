@@ -68,11 +68,11 @@ Exit code 0 alone proves nothing, and app.log is shared by every build and
 session on the machine, so prove the line came from this build:
 
 ```bat
-cmd.exe /c findstr /N /C:"startup: Tiro 1.0.0" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
+cmd.exe /c findstr /N /C:"startup: Tiro 1.1.0" /C:"selftest final" "%LOCALAPPDATA%\Tiro\logs\app.log"
 ```
 
 `/N` numbers the lines, so ordering is visible: take the **last**
-`startup: Tiro 1.0.0 (<hash>)` line whose hash equals the build's `stamp:` (or
+`startup: Tiro 1.1.0 (<hash>)` line whose hash equals the build's `stamp:` (or
 `git rev-parse --short HEAD`); a `selftest final:` line must appear after it.
 Not necessarily immediately - debug mode logs the banner, core pinning,
 `engine ready` and `selftest: 6 s of audio` in between.
@@ -107,7 +107,7 @@ unit-test harness; do not invent one.
 - **Do not commit** `models/`, the unpacked `third_party/*/` folder, `bin/`,
   `build/` or `src/gitver.h`. The 55 MB `.tar.xz` archive and the two C API
   headers **are** tracked on purpose.
-- **Do not re-add punctuation processing.** Rev 31 removed the self-written
+- **Do not re-add punctuation processing.** The self-written
   middleware; the app injects raw model output. The optional polish model is
   opt-in and off by default - leave it optional.
 - **Behavioural code changes sync the spec**: update
@@ -127,11 +127,11 @@ unit-test harness; do not invent one.
 Only at release time, from a clean committed tree:
 
 ```bat
-cmd.exe /c make_release.bat 1.0.0
+cmd.exe /c make_release.bat 1.1.0
 ```
 
 It refuses a dirty tree, tags `v<version>`, stages `Tiro\`, writes
-`build\Tiro-1.0.0-win64.zip`, re-opens the zip to verify the entry list and the
+`build\Tiro-1.1.0-win64.zip`, re-opens the zip to verify the entry list and the
 exe hash, and writes a `.sha256` beside it. Builds are **not** zipped; never
 hand-zip a release.
 

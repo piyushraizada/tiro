@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 rem ===========================================================================
-rem  make_release.bat <version>      e.g.   make_release.bat 1.0.0
+rem  make_release.bat <version>      e.g.   make_release.bat 1.1.0
 rem
 rem  Turns an already-built, COMMITTED tree into the distributable artifact:
 rem    build\Tiro-<version>-win64.zip  (+ .sha256 beside it)
@@ -21,7 +21,7 @@ rem ===========================================================================
 
 set VER=%~1
 if "%VER%"=="" (
-    echo usage: make_release.bat ^<version^>    e.g.  make_release.bat 1.0.0
+    echo usage: make_release.bat ^<version^>    e.g.  make_release.bat 1.1.0
     exit /b 2
 )
 
@@ -87,6 +87,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  if (-not (Test-Path -LiteralPath $p)) { Write-Host ('missing model file: ' + $p); exit 1 } }"
 if errorlevel 1 exit /b 1
 
+rem --- 4b. model files match the shipped hash manifest ----------------------
+rem PROVENANCE.md says where the weights come from; this makes that checkable.
+rem dist\models.sha256 is committed and travels inside the zip as SHA256SUMS.txt,
+rem so anyone - a user, an IT reviewer - can re-hash the 633 MB of weights. A
+rem changed weight without a deliberately updated manifest stops the release here,
+rem which is the point: the model decides what text gets typed.
+if not exist "dist\models.sha256" (
+    echo error: dist\models.sha256 is missing - the model has no pinned hashes.
+    exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$bad = 0; $n = 0;" ^
+  "foreach ($line in Get-Content '%CD%\dist\models.sha256') {" ^
+  "  $line = $line.Trim(); if (-not $line) { continue };" ^
+  "  $h, $f = $line -split '\s+', 2; $f = $f.Trim(); $n++;" ^
+  "  $p = Join-Path '%MODEL%' $f;" ^
+  "  if (-not (Test-Path -LiteralPath $p)) { Write-Host ('FAIL missing model file: ' + $f); $bad = 1; continue };" ^
+  "  $a = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower();" ^
+  "  if ($a -ne $h.ToLower()) { Write-Host ('FAIL model hash mismatch: ' + $f); $bad = 1 } };" ^
+  "if ($n -eq 0) { Write-Host 'FAIL dist\models.sha256 lists no files'; exit 1 };" ^
+  "if ($bad) { exit 1 };" ^
+  "Write-Host ('model: ' + $n + ' files match dist\models.sha256')"
+if errorlevel 1 exit /b 1
+
 rem --- 5. stage and zip -----------------------------------------------------
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%ROOT%\models\nemotron-0.6b-en" 2>nul
@@ -98,6 +122,7 @@ copy /y "%REQ%\SECURITY.md"  "%ROOT%\" >nul
 xcopy /E /I /Y /Q "%MODEL%" "%ROOT%\models\nemotron-0.6b-en" >nul
 copy /y "dist\licenses\nemotron\LICENSE.txt" "%ROOT%\models\nemotron-0.6b-en\" >nul
 copy /y "dist\licenses\nemotron\NOTICE.txt"  "%ROOT%\models\nemotron-0.6b-en\" >nul
+copy /y "dist\models.sha256" "%ROOT%\models\nemotron-0.6b-en\SHA256SUMS.txt" >nul
 
 if exist "%OUT%" del "%OUT%"
 echo zipping: about 640 MB, this takes a moment ...
@@ -114,6 +139,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "  $names = $z.Entries | ForEach-Object { $_.FullName.Replace('\', '/') };" ^
   "  $need = @('Tiro/Tiro.exe','Tiro/README.txt','Tiro/LICENSE.txt','Tiro/NOTICE.txt','Tiro/SECURITY.md'," ^
   "            'Tiro/models/nemotron-0.6b-en/model.json','Tiro/models/nemotron-0.6b-en/encoder.int8.onnx'," ^
+  "            'Tiro/models/nemotron-0.6b-en/SHA256SUMS.txt'," ^
   "            'Tiro/models/nemotron-0.6b-en/LICENSE.txt','Tiro/models/nemotron-0.6b-en/NOTICE.txt');" ^
   "  foreach ($n in $need) { if (-not ($names -contains $n)) { Write-Host ('FAIL missing in zip: ' + $n); exit 1 } }" ^
   "  $e = $z.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'Tiro/Tiro.exe' };" ^

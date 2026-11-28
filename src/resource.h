@@ -41,6 +41,6 @@
 #define WM_APP_ENGINE_FAIL (WM_APP + 9)
 #define WM_APP_ENGINE_READY (WM_APP + 10)
 #define WM_APP_POLISH       (WM_APP + 12)
-#define WM_APP_POLISH_MISSING (WM_APP + 16)  // Rev 29: opt-in polish, optional model absent
+#define WM_APP_POLISH_MISSING (WM_APP + 16)  // opt-in polish, optional model absent
 #define HOTKEY_TOGGLE     1
 #define HOTKEY_TEST       2

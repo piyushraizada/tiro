@@ -24,6 +24,7 @@ licence the author chose for the whole work (section 2).
 | `requirements_and_bdd.md` | the specification |
 | `dist/README.txt`, `dist/NOTICE.txt` | end-user manual and attribution notices |
 | `dist/LICENSE.txt` | a compilation, assembled here, of the third-party texts in section 3 |
+| `dist/models.sha256` | the pinned SHA-256 of every file in the shipped speech model; `make_release.bat` refuses to package a model that does not match it, and the file ships in the zip as `models/nemotron-0.6b-en/SHA256SUMS.txt` |
 
 ## 2. The work itself
 
@@ -35,7 +36,7 @@ licence the author chose for the whole work (section 2).
 
 | Path | Component | Version pinned | Licence | Licence text shipped with it |
 |---|---|---|---|---|
-| `third_party/include/onnxruntime_c_api.h` | ONNX Runtime C API header | `ORT_API_VERSION 20` (ONNX Runtime 1.20.1) | MIT, © Microsoft Corporation | `third_party/licenses/onnxruntime-LICENSE.txt` |
+| `third_party/include/onnxruntime_c_api.h` | ONNX Runtime C API header | `ORT_API_VERSION 20` (the API level the header exposes; the runtime linked in is 1.28.2, which is the version the binary itself reports in About) | MIT, © Microsoft Corporation | `third_party/licenses/onnxruntime-LICENSE.txt` |
 | `third_party/include/sherpa-onnx-c-api.h` | sherpa-onnx C API header | v2.0.3 | Apache-2.0, © 2023 Xiaomi Corporation | `third_party/licenses/sherpa-onnx-LICENSE.txt` |
 | `third_party/sherpa-onnx-v2.0.3-win-x64-static-MT-Release-no-tts-lib.tar.xz` | the 14 static libraries the app links, repacked from upstream's `.tar.bz2` with `xz -9` (identical bytes, verified by hashing every member) | v2.0.3 | Apache-2.0 (sherpa-onnx) and MIT (ONNX Runtime) | both texts, above |
 
@@ -56,7 +57,7 @@ It is forced into Git with `git add -f` because `*.wav` is ignored.
 
 | Path in the zip | Component | Licence | Obligation and how it is met |
 |---|---|---|---|
-| `Tiro/models/nemotron-0.6b-en/` | NVIDIA Nemotron speech streaming model, 0.6B, int8 | NVIDIA Open Model License | full agreement ships as `LICENSE.txt` inside the model folder, and `NOTICE.txt` inside it carries the exact required sentence: *Licensed by NVIDIA Corporation under the NVIDIA Open Model License* |
+| `Tiro/models/nemotron-0.6b-en/` | NVIDIA Nemotron speech streaming model, 0.6B, int8 | NVIDIA Open Model License | full agreement ships as `LICENSE.txt` inside the model folder, and `NOTICE.txt` inside it carries the exact required sentence: *Licensed by NVIDIA Corporation under the NVIDIA Open Model License*. `SHA256SUMS.txt` inside the same folder pins every file's hash, so the weights that ship can be re-verified by anyone holding the zip. |
 | `Tiro/Tiro.exe` | built from this tree; statically links the section 3 components | Apache-2.0 and MIT | both licence texts ship as `LICENSE.txt` at the top of the archive; `dumpbin /dependents` gate proves the build carries no third-party DLL, only their code |
 | `Tiro/LICENSE.txt`, `Tiro/NOTICE.txt`, `Tiro/README.txt`, `Tiro/SECURITY.md` | documents | assembled here | sections 1 and 3 above |
 
@@ -72,7 +73,7 @@ Model source: <https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b>
 
 ```bash
 git ls-files | sed 's/.*\.//' | sort | uniq -c | sort -rn     # what kinds of files ship
-python -c "import zipfile;[print(n) for n in zipfile.ZipFile('build/Tiro-1.0.0-win64.zip').namelist()]"
+python -c "import zipfile;[print(n) for n in zipfile.ZipFile('build/Tiro-1.1.0-win64.zip').namelist()]"
 git grep -niE '<character>|<film>|<studio>|<brand>' -- . ':!third_party/*.tar.xz'   # expect nothing
 strings bin/Release/Tiro.exe | grep -iE 'https?://|copyright' | sort -u             # foreign code inside
 ```

@@ -15,6 +15,10 @@
 *.md      text eol=lf
 *.txt     text eol=lf
 
+# The model hash manifest is copied byte-for-byte into the release zip, where it has
+# to be parseable by PowerShell, certutil and sha256sum alike. LF, not CRLF.
+dist/models.sha256 text eol=lf
+
 # Binaries: never convert, never diff.
 *.ico  binary
 *.wav  binary

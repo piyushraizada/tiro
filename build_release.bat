@@ -42,7 +42,7 @@ if errorlevel 1 (
 echo toolchain: !VCVARS!
 
 rem Stamp the exact commit into src\gitver.h (generated, gitignored) so the About box and
-rem the log name the bits: Tiro 1.0.0 (4765fdf). -dirty = uncommitted changes went in.
+rem the log name the bits: Tiro 1.1.0 (97a8de4). -dirty = uncommitted changes went in.
 set TIROHASH=unknown
 set GITCMD=git
 if exist "C:\Program Files\Git\cmd\git.exe" set GITCMD="C:\Program Files\Git\cmd\git.exe"

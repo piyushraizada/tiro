@@ -1,8 +1,8 @@
 # Tiro — Real-Time Dictation for Windows
 
-**Version 1.0.0 · Revision 1**
+**Version 1.1.0**
 
-This is the specification for Tiro 1.0.0 as built and shipped. Every number and
+This is the specification for Tiro 1.1.0 as built and shipped. Every number and
 behaviour below is taken from the implementation (`src/main.cpp`,
 `src/punctuation.cpp`), and every requirement has at least one scenario in §7.
 
@@ -39,7 +39,7 @@ recognition, Unicode injection, microphone and model selection, a configurable
 hotkey, optional Startup registration, an optional punctuation rewrite, and the
 diagnostics needed to support all of it.
 
-### 2.2 Out of scope for 1.0.0
+### 2.2 Out of scope for 1.1.0
 
 - Remote Desktop, session switching, resume-from-sleep recovery.
 - Following the Windows default capture device *while* listening (§5.1.5).
@@ -136,7 +136,7 @@ Modal, centred, opened from the menu or `--debug --about`; it ends dictation
 first. Contents:
 
 ```
-Tiro 1.0.0 (<commit hash>)
+Tiro 1.1.0 (<commit hash>)
 
 Author:     Piyush Raizada
 Vibe coded with Hermes Agent (Nous Research), Qwen/Qwen3.8-Flash-Next
@@ -218,7 +218,7 @@ dialog instead of toggling dictation.
 5. **No live default-device following.** The default is resolved when capture
    opens — at turn-on and at a microphone change — not while listening. Plugging
    in a headset mid-dictation does not move the stream; an endpoint that
-   disappears surfaces through FR-1.7. This is a 1.0.0 limitation.
+   disappears surfaces through FR-1.7. This is a 1.1.0 limitation.
 6. **Device list.** Active capture endpoints only, by friendly name. Disabled,
    unplugged and ghost endpoints are not listed.
 7. **Device loss.** A failing `GetNextPacketSize` or a buffer flagged
@@ -328,7 +328,7 @@ dialog instead of toggling dictation.
 11. **Known limitation.** `SendInput` cannot deliver keystrokes to windows at a
     higher integrity level (elevated applications, secure desktop, Task Manager)
     and the OS reports no error; text for such a window is lost silently. This is
-    accepted for 1.0.0.
+    accepted for 1.1.0.
 
 ### 5.5 FR-5 State machine and toggle
 
@@ -487,6 +487,9 @@ RMS), `PauseMs` 2400 (min 200), `MaxUtteranceMs` 20000, `Rule1Ms`/`Rule2Ms`
 9. **No Event Log.** A portable executable cannot register an Event Log source
    without writing to HKLM, so the file is the log of record. No hooks of any
    kind are installed, and the process makes no network calls.
+10. **Bounded lines.** A message longer than the log line buffer is truncated
+   with `... [truncated]`. Logging never ends the process: a long dictation under
+   `LogText=1` must not be able to abort the app whose words it is recording.
 
 ### 5.11 FR-11 Diagnostics
 
@@ -516,7 +519,9 @@ switches. It grants no privilege, starts no dictation, and touches neither
    segment, `selftest final: <full transcript>` and `selftest: done`. It never
    opens the microphone, writes nothing to stdout or stderr, and **always exits
    0** — the transcript is the result, not the exit code. A wrong-format WAV logs
-   an error and still exits 0.
+   an error and still exits 0, and so does a WAV whose declared chunk lengths
+   disagree with the file: nothing is read past the bytes the file actually
+   contains.
 2. **Log-only output.** A GUI process has no console; every diagnostic reports
    through `app.log`.
 
@@ -567,10 +572,12 @@ once.
 ### 6.6 Notifications
 
 One layered pop-up class for messages and one for the eyeball, both
-`WS_EX_NOACTIVATE | WS_EX_TOPMOST` tool windows. Messages size themselves to
-their text and dismiss on a 5 s timer. The eyeball animates on a 33 ms timer from
-the RMS of captured audio, with slow reference tracking so it opens for quiet
-speech and stays shut in a noisy room.
+`WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT` tool windows: mouse input
+passes through them to the window underneath, so neither can swallow a click on
+something the user is working in. Messages size themselves to their text and
+dismiss on a 5 s timer. The eyeball animates on a 33 ms timer from the RMS of
+captured audio, with slow reference tracking so it opens for quiet speech and
+stays shut in a noisy room.
 
 ### 6.7 Optional punctuation rewrite
 
@@ -584,8 +591,12 @@ whitespace collapsed, 400-token windows with 50-token overlap — and the target
 updated in one act: for classic `EDIT`/`RichEdit` controls, `EM_EXSETSEL` plus
 `EM_REPLACESEL` are queued back-to-back with redraw suspended, so the control
 replaces the dictated span inside its own thread without ever painting a
-selection. Chromium/Electron/WinUI inputs that expose a writable UIA
-`ValuePattern` are rewritten in one `SetValue` call, applied only after the raw
+selection — after that span has been **read back and confirmed to be exactly the
+text Tiro typed**, so a caret that has moved in the meantime leaves the document
+untouched (`EM_GETTEXTRANGE` on a RichEdit, a whole-document read on a classic
+EDIT, which answers no range message). Chromium/Electron/WinUI inputs that
+expose a writable UIA `ValuePattern` are rewritten in one `SetValue` call,
+applied only after the raw
 span is verified to sit exactly where the caret left it; Tiro then waits for the
 accessibility tree to report the new value and places the caret at the end of
 the polished span, so dictation can continue from there. Targets matching
@@ -651,7 +662,9 @@ and `README.txt` explains the "More info → Run anyway" path.
 
 Models live in `models\` beside the executable and are read in place — nothing is
 extracted, copied or cached. A model folder is added by copying it, removed by
-deleting it.
+deleting it. `dist\models.sha256` pins the SHA-256 of every shipped model file;
+the release script refuses to package a model that no longer matches it, and the
+manifest travels inside the zip as `SHA256SUMS.txt`.
 
 **Release artifact** (`make_release.bat <version>`, run only from a clean,
 committed tree):
@@ -663,14 +676,14 @@ Tiro\
   LICENSE.txt
   NOTICE.txt
   SECURITY.md
-  models\nemotron-0.6b-en\   (manifest, four model files, LICENSE.txt, NOTICE.txt)
+  models\nemotron-0.6b-en\   (manifest, four model files, SHA256SUMS.txt, LICENSE.txt, NOTICE.txt)
 ```
 
-The script refuses a dirty tree, creates the `v<version>` tag if absent, stages
-that folder, writes `build\Tiro-<version>-win64.zip`, re-opens the archive to
-verify the entry list and that the packaged exe hashes equal to the built one,
-and writes a SHA-256 beside the zip. Upload is manual. Development builds produce
-no zip.
+The script refuses a dirty tree, creates the `v<version>` tag if absent, checks
+the model files against `dist\models.sha256`, stages that folder, writes
+`build\Tiro-<version>-win64.zip`, re-opens the archive to verify the entry list
+and that the packaged exe hashes equal to the built one, and writes a SHA-256
+beside the zip. Upload is manual. Development builds produce no zip.
 
 **Licence obligations.** Nemotron is distributed under the NVIDIA Open Model
 License: recipients must receive the agreement and a notice containing the

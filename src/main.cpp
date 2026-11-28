@@ -1,5 +1,5 @@
 ﻿// Tiro - Windows dictation app. Layer 1: tray shell, state machine, menu, dialogs.
-// Spec: requirements_and_bdd.md (Revision 32).
+// Spec: requirements_and_bdd.md (version 1.1.0).
 
 #include <windows.h>
 #include <shellapi.h>
@@ -143,16 +143,31 @@ static void RotateLogIfLarge()
     MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
+// A log line is bounded on purpose. The only unbounded callers are the LogText
+// diagnostics (a whole session's words, a whole rewrite), and swprintf_s aborts the
+// process when a formatted line does not fit - the CRT invalid-parameter handler runs,
+// not a truncation. A long dictation must never be able to kill the app it is being
+// logged from, so the message is cut here instead.
+static const size_t kLogMaxMsg = 1100;
+
 static void Log(const wchar_t* level, const std::wstring& msg)
 {
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    wchar_t line[1200];
-    swprintf_s(line, L"%04d-%02d-%02d %02d:%02d:%02d [%s] %s\n",
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, level, msg.c_str());
+    wchar_t head[80];
+    swprintf_s(head, L"%04d-%02d-%02d %02d:%02d:%02d [%s] ",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, level);
+    std::wstring line = head;
+    if (msg.size() > kLogMaxMsg) {
+        line.append(msg, 0, kLogMaxMsg);
+        line += L"... [truncated]";
+    } else {
+        line += msg;
+    }
+    line += L'\n';
     FILE* f = nullptr;
     if (_wfopen_s(&f, LogPath().c_str(), L"a, ccs=UTF-8") == 0 && f) {
-        fputws(line, f);
+        fputws(line.c_str(), f);
         fclose(f);
     }
 }
@@ -453,7 +468,9 @@ static void InitNotify()
     wc.lpszClassName = kNotifyClass;
     RegisterClassExW(&wc);
     g_notify.hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        // WS_EX_TRANSPARENT: the popup is output-only, so mouse input belongs to
+        // whatever is underneath it - it must never swallow a click.
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
         kNotifyClass, L"Tiro", WS_POPUP, 0, 0, 360, 80, nullptr, nullptr, g.hInst, nullptr);
 }
 
@@ -992,7 +1009,9 @@ static void InitEyeball()
     RegisterClassExW(&wc);
 
     g_eye.hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        // WS_EX_TRANSPARENT: the eyeball is output-only and covers a corner of the
+        // screen, so clicks must fall through to the window under it.
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
         kEyeClass, L"Tiro", WS_POPUP, 0, 0, g_eye.size, g_eye.size,
         nullptr, nullptr, g.hInst, nullptr);
 
@@ -1033,7 +1052,7 @@ struct Engine {
     const SherpaOnnxOnlineStream* stream = nullptr;
     unsigned long long samplesSinceCut = 0;   // for log segments only; the stream is never reset mid-dictation
     size_t cutTyped = 0;                 // g_typed length at the last log split or session start
-    // Rev 30/32: a user-initiated stop drains instead of dropping. Set by StopDictation after
+    // A user-initiated stop drains instead of dropping. Set by StopDictation after
     // the microphone is closed; the inference thread finishes decoding the queue, the injector
     // types it (g_drainActive lets it act while the app is already Off), then the flags clear.
     // drainUntil bounds the drain so a stalled decoder can never type long after the click.
@@ -1218,10 +1237,20 @@ struct Segmenter {
     static Segmenter FromRegistry()
     {
         Segmenter s;
-        s.silenceRms = RegGetDword(L"SilenceRmsPct", 1) / 100.0f;
+        // Every value below is registry-supplied and therefore arbitrary. Clamp to the
+        // range the app can honour, so a mistyped switch degrades instead of
+        // overflowing (16000 * MaxUtteranceMs does not fit a long at 4e9) or making
+        // every slice a "long" cut (a negative maxSegSamples).
+        DWORD pct = RegGetDword(L"SilenceRmsPct", 1);
+        if (pct < 1) pct = 1;
+        if (pct > 100) pct = 100;
+        s.silenceRms = pct / 100.0f;
         s.pauseMs    = (int)RegGetDword(L"PauseMs", 2400);
-        s.maxSegSamples = 16000L * (long)RegGetDword(L"MaxUtteranceMs", 20000);
         if (s.pauseMs < 200) s.pauseMs = 200;
+        DWORD maxMs = RegGetDword(L"MaxUtteranceMs", 20000);
+        if (maxMs < 1000) maxMs = 1000;
+        if (maxMs > 120000) maxMs = 120000;      // ceiling keeps 16000 * maxMs inside a long
+        s.maxSegSamples = (long)((long long)16000 * (long long)maxMs);
         return s;
     }
 
@@ -1271,9 +1300,9 @@ static void MarkSessionBoundary()
     g_engine.cutTyped = t.size();
 }
 
-// What the decoder hears is what gets typed. (Rev 28 added a deterministic punctuation
-// middleware here; Rev 31 removed it for the first release - Nemotron's own punctuation
-// ships instead, and the optional polish model remains the only rewriting pass.)
+// What the decoder hears is what gets typed: no middleware sits between the recogniser and
+// the injector. Nemotron punctuates natively, and the optional polish model is the only
+// rewriting pass.
 static void DeliverStreamDelta()
 {
     if (!g_engine.rec || !g_engine.stream) return;
@@ -1296,7 +1325,7 @@ static void DeliverStreamDelta()
     std::string raw = cur.substr(g_typed.size());
     g_typed = cur;
     if (raw.empty()) return;
-    // Rev 31: raw model output goes straight to the target. Nemotron punctuates natively;
+    // Raw model output goes straight to the target. Nemotron punctuates natively;
     // the deterministic middleware that once sat here was removed for the first release.
     QueueInject(Utf8ToWide(raw), !g_uttStarted);   // one space between utterances, none inside one
     g_uttStarted = true;
@@ -1320,8 +1349,17 @@ static bool CreateRecognizer()
     std::string dec = ManifestField(manifest, "decoder");
     std::string joi = ManifestField(manifest, "joiner");
     std::string tok = ManifestField(manifest, "tokens");
-    if (enc.empty() || dec.empty() || joi.empty() || tok.empty()) {
-        Log(L"ERROR", L"model manifest is missing required file names");
+    // The manifest is data, not code: accept only a plain file name in the folder the
+    // manifest came from. No ..\, no drive, no separators - a model folder is not a
+    // route to the rest of the disk.
+    auto plainName = [](const std::string& f) {
+        return !f.empty() && f.find("..") == std::string::npos &&
+               f.find('\\') == std::string::npos && f.find('/') == std::string::npos &&
+               f.find(':') == std::string::npos;
+    };
+    if (enc.empty() || dec.empty() || joi.empty() || tok.empty() ||
+        !plainName(enc) || !plainName(dec) || !plainName(joi) || !plainName(tok)) {
+        Log(L"ERROR", L"model manifest is missing or names files outside its model folder");
         return false;
     }
 
@@ -1347,7 +1385,10 @@ static bool CreateRecognizer()
         // Set the Threads DWORD only if typing ever trails the voice. (The freeze that once
         // came with high thread counts was ORT threads spinning on E-cores; PinToPcores()
         // above removes that failure mode, not the thread count itself.)
+        // Clamped: the value comes from the registry, so it can be any DWORD - a mistyped
+        // switch must degrade, not hand a negative thread count to the engine.
         DWORD t = RegGetDword(L"Threads", 0);
+        if (t > 64) t = 64;
         cfg.model_config.num_threads = t ? (int)t : 1;
     }
     cfg.model_config.provider = "cpu";
@@ -1370,7 +1411,7 @@ static bool CreateRecognizer()
     g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
     g_typed.clear();
     g_uttStarted = false;
-    // (Rev 31: raw output - no middleware state to reset here)
+    // (raw output - no middleware state to reset here)
     if (!g_engine.stream) {
         Log(L"ERROR", L"stream creation failed");
         return false;
@@ -1389,7 +1430,7 @@ static void DestroyRecognizer()
 }
 
 static DWORD WINAPI EngineThread(LPVOID);
-// Declared before EngineThread: the drain-completion wait (Rev 30) inspects the inject queue.
+// Declared before EngineThread: the drain-completion wait inspects the inject queue.
 static std::deque<std::wstring> g_injectQ;
 static std::mutex g_injectMu;
 
@@ -1403,7 +1444,7 @@ static DWORD WINAPI EngineThread(LPVOID)
         g_engine.stream = SherpaOnnxCreateOnlineStream(g_engine.rec);
     g_typed.clear();
     g_uttStarted = false;
-    // (Rev 31: raw output - no middleware state to reset here)
+    // (raw output - no middleware state to reset here)
         if (!g_engine.stream) {
             PostMessageW(g.hwnd, WM_APP_ENGINE_FAIL, 0, 0);
             return 0;
@@ -1423,9 +1464,9 @@ static DWORD WINAPI EngineThread(LPVOID)
                                  [] { return g_engine.stop || !g_engine.q.empty(); });
             if (g_engine.stop) break;
             if (g_engine.drain && g_engine.q.empty()) {
-                // Rev 30: user stopped; everything captured so far is now decoded. Release the
+                // User stopped; everything captured so far is now decoded. Release the
                 // middleware after the drained words so the punctuation lands in order.
-                // Rev 33: and wrap up. A finished-flag alone decodes nothing - the transducer
+                // And wrap up. A finished-flag alone decodes nothing - the transducer
                 // is never "ready" once samples run dry - so hand it half a second of silence:
                 // the endpointer fires, the lookahead completes, and the last words come out of
                 // the normal path. Then declare the input finished for good, flush once more,
@@ -1480,6 +1521,7 @@ static DWORD WINAPI EngineThread(LPVOID)
         // bounded by the slice size instead: 1600 samples is 100 ms.
         size_t slice = (size_t)RegGetDword(L"SliceMs", 100) * 16;
         if (slice < 160) slice = 160;
+        if (slice > 16000) slice = 16000;      // registry value is arbitrary: cap at 1 s
         size_t pos = 0;
         while (pos < buf.size()) {
             size_t n = (std::min)(slice, buf.size() - pos);
@@ -1534,7 +1576,7 @@ static DWORD WINAPI EngineThread(LPVOID)
         }
 
         if (drainDone) {
-            // Rev 32: the drain is only over once the words are actually IN the document.
+            // The drain is only over once the words are actually IN the document.
             // Wait (bounded) for the injector to finish - queue empty and nothing mid-SendInput -
             // then stop accepting drain-time injection and arm the polish pass, which rewrites
             // exactly what was delivered and so must see the tail too.
@@ -1675,19 +1717,27 @@ static bool ReadWav16kMono(const std::wstring& path, std::vector<float>& out)
     while (p + 8 <= got) {
         DWORD len = *(DWORD*)(data.data() + p + 4);
         if (tag(p, "fmt ")) {
+            // channels/rate/bits sit at +10/+12/+22 inside the chunk: refuse a header
+            // that is shorter than the fields being read from it.
+            if (len < 16 || p + 8 + 16 > (size_t)got) return false;
             channels = *(short*)(data.data() + p + 10);
             rate     = *(int*)(data.data() + p + 12);
             bits     = *(short*)(data.data() + p + 22);
         } else if (tag(p, "data")) {
             dataOff = p + 8;
-            dataLen = len;
+            // The declared length is a claim about the file, not a fact: a truncated
+            // download or a crafted file can promise gigabytes. Trust only what was
+            // actually read, so the sample loop can never walk off the buffer.
+            size_t avail = (size_t)got - dataOff;
+            dataLen = ((size_t)len < avail) ? (size_t)len : avail;
         }
-        p += 8 + len + (len & 1);
+        p += 8 + (size_t)len + (len & 1);
     }
     if (!dataOff || channels != 1 || rate != 16000 || bits != 16) return false;
 
     const short* s = (const short*)(data.data() + dataOff);
     size_t n = dataLen / 2;
+    if (!n) return false;
     out.resize(n);
     for (size_t i = 0; i < n; ++i) out[i] = s[i] / 32768.0f;
     return true;
@@ -1716,6 +1766,7 @@ static void RunSelfTest(const std::wstring& wav)
     while (pos < samples.size()) {
         size_t chunk = (size_t)RegGetDword(L"ChunkMs", 100) * 16;
         if (chunk < 160) chunk = 160;
+        if (chunk > 16000) chunk = 16000;      // registry value is arbitrary: cap at 1 s
         size_t n = (std::min)(chunk, samples.size() - pos);
         size_t at = pos;
         SherpaOnnxOnlineStreamAcceptWaveform(g_engine.stream, 16000, samples.data() + pos, (int)n);
@@ -1788,7 +1839,7 @@ static DWORD WINAPI FeederThread(LPVOID)
 // and any installed low-level keyboard hook — which stalls input system-wide. A dedicated
 // thread absorbs that, and the queue is bounded so a stalled target cannot grow memory.
 
-// g_injectQ / g_injectMu are declared above, before EngineThread (Rev 30).
+// g_injectQ / g_injectMu are declared above, before EngineThread.
 static std::condition_variable g_injectCv;
 static bool g_injectStop = false;
 static HANDLE g_injectThread = nullptr;
@@ -2360,7 +2411,7 @@ static DWORD WINAPI PolishInitThread(LPVOID)
     int t = (int)RegGetDword(L"PolishThreads", 1);
     if (!punct::Init(ExeDir() + L"\\models\\punctuation", PolishLog, t)) {
         Log(L"INFO", L"polish disabled: models\\punctuation missing or unreadable");
-        // Rev 29: the polish model no longer ships in the zip, so this is now the
+        // The polish model does not ship in the zip, so this is the
         // DEFAULT install state. A user who opted in must hear why nothing changed
         // instead of watching the rewrite silently never happen.
         if (g.hwnd) PostMessageW(g.hwnd, WM_APP_POLISH_MISSING, 0, 0);
@@ -2386,12 +2437,51 @@ static HWND FocusedEditOf(HWND target)
 // injection. Because the set-select and replace are queued together, the
 // control never has to paint the intermediate selection - the user sees raw
 // text become polished text in one update.
-// Returns false for any control that is not a classic edit window, for a live
-// foreign selection, or when the target is hung; the text is then left as typed.
-static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring& polished)
+
+// ---- Span read-back ---------------------------------------------------------
+// Reads exactly [cp - n, cp) back out of the control, so a rewrite can prove the span it
+// is about to replace is still the text Tiro typed. Each class gets the message that
+// actually works on it - measured, not assumed: a RichEdit counts a line break as ONE
+// character position but returns CRLF from WM_GETTEXT, so a whole-document read is
+// offset by one per line break (EM_GETTEXTRANGE returns the exact range); a classic
+// EDIT keeps CRLF in its buffer, lines up with EM_GETSEL, and does not answer
+// EM_GETTEXTRANGE at all.
+static bool ReadSpanBack(HWND ed, bool rich, LONG cpMin, size_t n, std::wstring& out)
 {
+    if (!n || n > 1000000u) return false;                 // nothing sane to verify
+    out.assign(n, L'\0');
+    if (rich) {
+        TEXTRANGE tr{};
+        tr.chrg.cpMin = cpMin - (LONG)n;
+        tr.chrg.cpMax = cpMin;
+        tr.lpstrText  = out.data();
+        DWORD_PTR copied = 0;
+        if (!SendMessageTimeoutW(ed, EM_GETTEXTRANGE, 0, (LPARAM)&tr, SMTO_ABORTIFHUNG, 300, &copied))
+            return false;
+        return copied == (DWORD_PTR)n;
+    }
+    DWORD_PTR len = 0;
+    if (!SendMessageTimeoutW(ed, WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 200, &len)) return false;
+    if (len > 2000000u || (DWORD_PTR)cpMin > len) return false;
+    std::wstring all((size_t)len + 1, L'\0');
+    DWORD_PTR got = 0;
+    if (!SendMessageTimeoutW(ed, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)all.data(),
+                             SMTO_ABORTIFHUNG, 500, &got))
+        return false;
+    if (got < (DWORD_PTR)cpMin) return false;
+    out.assign(all, (size_t)cpMin - n, n);
+    return true;
+}
+
+// ---- One-shot replace, Win32 EDIT / RichEdit --------------------------------
+// Returns false for any control that is not a classic edit window, for a live
+// foreign selection, when the caret has moved away from the dictated span, or when
+// the target is hung; the text is then left as typed.
+static bool RewriteViaReplaceSel(HWND target, const std::wstring& raw, const std::wstring& polished)
+{
+    const size_t nchars = raw.size();
     if (g_polishCancel) return false;
-    if (!IsWindow(target)) return false;
+    if (!IsWindow(target) || raw.empty()) return false;
     HWND ed = FocusedEditOf(target);
     if (!ed) return false;
     wchar_t cls[40] = {};
@@ -2409,6 +2499,15 @@ static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring&
         CHARRANGE cr = {};
         if (!SendMessageTimeoutW(ed, EM_EXGETSEL, 0, (LPARAM)&cr, SMTO_ABORTIFHUNG, 200, nullptr)) return false;
         if (cr.cpMin != cr.cpMax || cr.cpMin < 0 || (size_t)cr.cpMin < nchars) return false;
+        // The caret must sit where the dictation left it AND the characters behind it
+        // must still be the ones Tiro typed. Without this second test a click into
+        // another part of the same document during the rewrite would make the
+        // "dictated span" somebody else's paragraph.
+        std::wstring seen;
+        if (!ReadSpanBack(ed, true, cr.cpMin, nchars, seen) || seen != raw) {
+            Log(L"WARN", L"polish: the span behind the caret is not the dictated text; left as typed");
+            return false;
+        }
         CHARRANGE sel = { cr.cpMin - (LONG)nchars, cr.cpMin };
         DWORD_PTR r = 0;
         // Suspend redraw so the set-select never paints: the control draws once,
@@ -2426,7 +2525,12 @@ static bool RewriteViaReplaceSel(HWND target, size_t nchars, const std::wstring&
     DWORD sel = 0;
     if (!SendMessageTimeoutW(ed, EM_GETSEL, 0, (LPARAM)&sel, SMTO_ABORTIFHUNG, 200, nullptr)) return false;
     DWORD start = LOWORD(sel), end = HIWORD(sel);
-    if (start != end || start < nchars) return false;
+    if (start != end || (size_t)start < nchars) return false;
+    std::wstring seen;
+    if (!ReadSpanBack(ed, false, (LONG)start, nchars, seen) || seen != raw) {
+        Log(L"WARN", L"polish: the span behind the caret is not the dictated text; left as typed");
+        return false;
+    }
     SendMessageTimeoutW(ed, WM_SETREDRAW, FALSE, 0, SMTO_ABORTIFHUNG, 200, nullptr);
     BOOL setOk = SendMessageTimeoutW(ed, EM_SETSEL, start - (UINT)nchars, (LPARAM)start, SMTO_ABORTIFHUNG, 200, nullptr) != 0;
     BOOL repOk = FALSE;
@@ -2742,7 +2846,7 @@ static DWORD WINAPI PolishThread(LPVOID p)
     // for Chromium/Electron/WinUI inputs that expose a writable value. If neither
     // applies the text is left exactly as typed and the log says so.
     ULONGLONG t1 = GetTickCount64();
-    bool oneShot = RewriteViaReplaceSel(job->target, job->text.size(), out);
+    bool oneShot = RewriteViaReplaceSel(job->target, job->text, out);
     const wchar_t* via = L"replace-sel";
     if (!oneShot) {
         oneShot = RewriteViaUIAValue(job->target, job->text, out);
@@ -2803,7 +2907,7 @@ static void StopDictation(const wchar_t* why, bool userInitiated = false)
     HideEyeball();
     if (userInitiated)
     {
-        // Rev 30/32: when the USER stops, the words still in flight are the end of their
+        // When the USER stops, the words still in flight are the end of their
         // sentence, not stale speech. Close the microphone and let the inference thread decode
         // what it already has; the injector types it (drainActive), the drain completes only
         // when the document has the words, and only then does the polish pass see the session.
@@ -3151,7 +3255,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_APP_POLISH_MISSING:
-        // Rev 29: the polish model is an optional download; a user who enabled polish
+        // The polish model is an optional download; a user who enabled polish
         // without it gets the reason and the fix, once, instead of silence.
         Notify(L"Punctuation model not found. It is optional and not part of the download \u2014 "
                L"see README.txt to add it, then restart Tiro.");
@@ -3269,9 +3373,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         for (int i = 1; argv && i < n; ++i) {
             if (!_wcsicmp(argv[i], L"--wait-handle") && i + 1 < n) {
                 HANDLE h = (HANDLE)(uintptr_t)_wcstoui64(argv[i + 1], nullptr, 10);
-                if (h && h != INVALID_HANDLE_VALUE) {
+                // The number is a claim from the command line, not a fact: anything this
+                // process does not already hold is refused instead of waited on and closed.
+                DWORD info = 0;
+                if (h && h != INVALID_HANDLE_VALUE && GetHandleInformation(h, &info)) {
                     WaitForSingleObject(h, 15000);   // cap it: a wedged parent must not wed us
                     CloseHandle(h);
+                } else if (h) {
+                    Log(L"WARN", L"restart: --wait-handle is not a handle of this process; ignored");
                 }
             }
         }
@@ -3367,7 +3476,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     InitEyeball();
     InstallForegroundHook();
     StartInjector();
-    // Rev 27: polish ships OFF. The Nemotron checkpoint punctuates natively and
+    // Polish ships OFF. The Nemotron checkpoint punctuates natively and
     // well enough; the rewrite pass's UX needs more work before it may surprise a
     // fresh install. Users opt IN from the tray (restart-scoped, as always).
     g_polishEnabled = RegGetDword(L"Polish", 0) != 0;
@@ -3404,7 +3513,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             HWND top = CreateWindowExW(WS_EX_TOPMOST, wcd.lpszClassName, L"Tiro rewrite demo",
                                        WS_OVERLAPPEDWINDOW, 200, 200, 600, 300,
                                        nullptr, nullptr, wcd.hInstance, nullptr);
-            LoadLibraryW(L"Msftedit.dll");   // RICHEDIT50W lives here (riched20 is the older class)
+            // Msftedit.dll lives in System32; a bare name would search this app's own
+            // folder first, and Tiro is portable - it normally runs from Downloads,
+            // the Desktop, or wherever it was unzipped. Never load a DLL from there.
+            LoadLibraryExW(L"Msftedit.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);   // RICHEDIT50W lives here (riched20 is the older class)
             HWND ed = CreateWindowExW(0, L"RICHEDIT50W", L"",
                                       WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
                                       10, 10, 560, 260, top, nullptr, wc.hInstance, nullptr);
@@ -3452,12 +3564,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             Log(L"INFO", e0);
             // Run the rewrite on a worker thread exactly as PolishThread does in production,
             // while this (the target's) thread pumps.
-            struct RWJob { HWND top; size_t n; const wchar_t* pol; bool ok; }
-                job = { top, wcslen(raw), pol, false };
+            struct RWJob { HWND top; std::wstring raw; const wchar_t* pol; bool ok; }
+                job = { top, raw, pol, false };
             ULONGLONG t0 = GetTickCount64();
             HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
                 RWJob* j = (RWJob*)p;
-                j->ok = RewriteViaReplaceSel(j->top, j->n, j->pol);
+                j->ok = RewriteViaReplaceSel(j->top, j->raw, j->pol);
                 Log(j->ok ? L"INFO" : L"ERROR",
                     j->ok ? L"rewrite-demo: replaced via EM_REPLACESEL"
                           : L"rewrite-demo: EM_REPLACESEL failed on own control");

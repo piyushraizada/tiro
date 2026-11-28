@@ -193,6 +193,9 @@ static bool LoadTokenizer(const std::wstring& path)
         ++p;
         long long id = 0;
         p = ParseInt(p, id);
+        // A token id is data from the file. A value in the billions would ask for a
+        // resize no machine can serve, and id + 1 would wrap - refuse instead of guessing.
+        if (id < 0 || id > 1000000) return false;
         if (g_vocabId.count(tok)) return false;      // duplicate token: refuse, don't guess
         g_vocabId.emplace(tok, (int)id);
         if ((int)g_vocabTok.size() < id + 1) g_vocabTok.resize(id + 1);
