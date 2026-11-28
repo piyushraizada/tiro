@@ -2568,6 +2568,16 @@ static DWORD WINAPI PolishThread(LPVOID p)
     std::wstring out;
     ULONGLONG t0 = GetTickCount64();
     try { out = punct::Polish(job->text); } catch (...) { out.clear(); }
+    if (!out.empty() && !job->text.empty()) {
+        // The model trims; whitespace the user actually dictated at the span
+        // edges (typically the leading space that joins this session to the
+        // previous one) stays visible - the rewrite replaces those characters,
+        // so it must re-emit them.
+        if (iswspace(job->text.front()) && !iswspace(out.front()))
+            out.insert(out.begin(), L' ');
+        if (iswspace(job->text.back()) && !iswspace(out.back()))
+            out.push_back(L' ');
+    }
     ULONGLONG dt = GetTickCount64() - t0;
 
     wchar_t b[192];
